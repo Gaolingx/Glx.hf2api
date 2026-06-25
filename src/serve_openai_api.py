@@ -9,9 +9,10 @@ import os
 import sys
 import yaml
 import time
+import uuid
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Literal
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +22,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -111,10 +112,42 @@ class GenerationParams(BaseModel):
     no_repeat_ngram_size: int = Field(default=0, ge=0)
 
 
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str  # JSON string
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+    reasoning_content: Optional[str] = None
+
+    @model_validator(mode='after')
+    def validate_role_constraints(self):
+        if self.role == "tool":
+            if not self.tool_call_id:
+                raise ValueError("tool message must have tool_call_id")
+            if not self.content:
+                raise ValueError("tool message must have content")
+        if self.role == "assistant":
+            if self.tool_calls and self.content and self.content.strip():
+                # assistant 同时有 tool_calls 和 content 是允许的，但记录警告
+                pass
+        return self
+
+
 class ChatRequest(BaseModel):
     """OpenAI-compatible chat completion request"""
     model: str
-    messages: list
+    messages: List[Message]
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
@@ -137,6 +170,53 @@ class ChatRequest(BaseModel):
                     self.chat_template_kwargs.get('enable_thinking', False)
             )
         return False
+
+    @model_validator(mode='after')
+    def validate_tool_call_references(self):
+        """
+        校验 tool message 的 tool_call_id 必须有对应且尚未被消费的 assistant tool_call。
+
+        多轮对话中同一 id 不应跨轮复用：
+          Round1: assistant(call_A) -> tool(call_A)   # call_A 已消费
+          Round2: assistant(call_B) -> tool(call_B)   # call_B 已消费
+          ❌ tool(call_A) 出现第二次 -> 报错
+        """
+        # pending: 已发出但尚未被 tool 消费的 call_id
+        # consumed: 已被 tool 消费的 call_id（不允许重复消费）
+        pending: Dict[str, int] = {}   # call_id -> messages index（便于错误定位）
+        consumed: set = set()
+
+        for i, msg in enumerate(self.messages):
+            if msg.role == "assistant" and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.id in consumed:
+                        raise ValueError(
+                            f"messages[{i}]: tool_call_id '{tc.id}' was already consumed "
+                            f"by a previous tool message. IDs must be unique across turns."
+                        )
+                    pending[tc.id] = i
+
+            elif msg.role == "tool":
+                tid = msg.tool_call_id
+                if tid in consumed:
+                    raise ValueError(
+                        f"messages[{i}]: tool_call_id '{tid}' has already been consumed "
+                        f"by a previous tool message."
+                    )
+                if tid not in pending:
+                    raise ValueError(
+                        f"messages[{i}]: tool_call_id '{tid}' has no matching "
+                        f"assistant tool_call. Pending IDs: {set(pending.keys())}"
+                    )
+                consumed.add(tid)
+                del pending[tid]
+
+        # 流程结束后 pending 非空说明有未被响应的 tool_call（允许，最后一轮可以尚未执行）
+        # 不报错，只记录 debug 信息
+        if pending:
+            logger.debug(f"Unresolved tool_calls at end of messages: {set(pending.keys())}")
+
+        return self
 
     def get_generation_params(self) -> Dict[str, Any]:
         gen_config = config.get('generation', {})
@@ -590,25 +670,31 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def generate_tool_call_id() -> str:
+    return f"call_{uuid.uuid4().hex[:24]}"
+
+
 def parse_response(text: str):
     """Parse model response to extract reasoning content and tool calls"""
-    reasoning_content = None
-    think_match = re.search(r'<thinking>(.*?)</thinking>', text, re.DOTALL)
-    if think_match:
-        reasoning_content = think_match.group(1).strip()
-        text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL)
-    elif ' thinking' in text and ' response' in text:
-        parts = text.split(' response', 1)
-        if len(parts) == 2:
-            reasoning_content = parts[0].replace(' thinking', '').strip()
-            text = parts[1].strip()
+    # 提取所有 thinking 块（支持多个，合并为一个 reasoning_content）
+    THINK_PATTERN = re.compile(
+        r'<(thinking|think)>(.*?)</(thinking|think)>',
+        re.DOTALL
+    )
+    reasoning_parts = []
+    def _collect_thinking(m: re.Match) -> str:
+        reasoning_parts.append(m.group(2).strip())
+        return ''   # 替换为空字符串，从 text 中移除
+
+    text = THINK_PATTERN.sub(_collect_thinking, text)
+    reasoning_content = '\n'.join(reasoning_parts) if reasoning_parts else None
 
     tool_calls = []
     for i, m in enumerate(re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL)):
         try:
             call = json.loads(m.strip())
             tool_calls.append({
-                "id": f"call_{int(time.time())}_{i}",
+                "id": generate_tool_call_id(),
                 "type": "function",
                 "function": {
                     "name": call.get("name", ""),
@@ -753,6 +839,44 @@ async def memory_cleanup_task():
 # FastAPI Application
 # ============================================================================
 
+def normalize_messages_for_template(messages: List[dict]) -> List[dict]:
+    """
+    将 Pydantic model_dump 产出的 messages 规范化，
+    确保 tool_calls[].function.arguments 始终为 str（JSON 字符串），
+    同时兼容部分模型 chat_template 期望 dict 的情况由 tokenizer 自行处理。
+    此函数统一输出 str，与 OpenAI 规范一致。
+    """
+    normalized = []
+    for msg in messages:
+        msg = dict(msg)  # shallow copy，避免修改原始数据
+        if msg.get("tool_calls"):
+            new_tool_calls = []
+            for tc in msg["tool_calls"]:
+                tc = dict(tc)
+                func = dict(tc.get("function", {}))
+                args = func.get("arguments", {})
+                if isinstance(args, dict):
+                    # dict -> JSON str
+                    func["arguments"] = json.dumps(args, ensure_ascii=False)
+                elif isinstance(args, str):
+                    # 已经是 str，验证是否合法 JSON
+                    try:
+                        json.loads(args)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"tool_call arguments is invalid JSON str: {args[:100]}, "
+                            f"wrapping as empty object"
+                        )
+                        func["arguments"] = "{}"
+                else:
+                    func["arguments"] = json.dumps(args, ensure_ascii=False)
+                tc["function"] = func
+                new_tool_calls.append(tc)
+            msg["tool_calls"] = new_tool_calls
+        normalized.append(msg)
+    return normalized
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for FastAPI app"""
@@ -799,9 +923,10 @@ async def memory_check_middleware(request: Request, call_next):
     if request.url.path.startswith("/v1/chat/completions"):
         if not memory_monitor.check_memory_available():
             stats = memory_monitor.get_memory_stats()
-            return HTTPException(
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
                 status_code=503,
-                detail=f"GPU memory exhausted: {stats}"
+                content={"detail": f"GPU memory exhausted: {stats}"}
             )
 
     response = await call_next(request)
@@ -818,7 +943,9 @@ async def chat_completions(request: ChatRequest):
         # Create inference request
         inference_request = InferenceRequest(
             request_id=request_id,
-            messages=request.messages,
+            messages=normalize_messages_for_template(
+                [msg.model_dump(exclude_none=True) for msg in request.messages]
+            ),
             gen_params=gen_params,
             tools=request.tools,
             open_thinking=request.get_open_thinking(),
@@ -830,37 +957,170 @@ async def chat_completions(request: ChatRequest):
 
         # Handle streaming response
         if request.stream:
+            def emit_tool_call_stream_chunks(raw_buffer: str, tc_index: int):
+                """
+                将完整的 <tool_call>...</tool_call> 字符串按 OpenAI 流式格式拆分。
+                raw_buffer 必须包含且仅包含一个完整 tool_call 块。
+                """
+                m = re.search(r'<tool_call>(.*?)</tool_call>', raw_buffer, re.DOTALL)
+                if not m:
+                    logger.warning(f"emit_tool_call_stream_chunks: no tool_call found in buffer")
+                    return
+                try:
+                    call = json.loads(m.group(1).strip())
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse tool_call JSON in stream: {e}, raw={m.group(1)[:200]}")
+                    return
+
+                call_id = generate_tool_call_id()
+                args_str = json.dumps(call.get("arguments", {}), ensure_ascii=False)
+                func_name = call.get("name", "")
+
+                # Chunk 1: id + name + 空 arguments
+                yield (
+                    f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': tc_index, 'id': call_id, 'type': 'function', 'function': {'name': func_name, 'arguments': ''}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                )
+                # Chunk 2~N: arguments 分块
+                chunk_size = 16
+                for start in range(0, len(args_str), chunk_size):
+                    chunk = args_str[start: start + chunk_size]
+                    yield (
+                        f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': tc_index, 'function': {'arguments': chunk}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                    )
+
             async def stream_generator():
                 """Async generator for streaming response"""
                 full_text = ""
-                thinking_ended = not request.get_open_thinking()
+                open_thinking = request.get_open_thinking()
 
-                for text in result:  # result is a generator
-                    full_text += text
+                phase = "pending_think"
+                think_open_tag = None
+                thinking_start = 0
+                MAX_THINK_WAIT = 50
 
-                    # Parse thinking vs response
-                    if not thinking_ended:
-                        if '</thinking>' in full_text or ' response' in full_text:
-                            thinking_ended = True
-                            parts = re.split(r'</thinking>| response', full_text, 1)
-                            reasoning = parts[0].replace('<thinking>', '').strip()
-                            if reasoning:
-                                yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': reasoning}}]}, ensure_ascii=False)}\n\n"
-                            if len(parts) > 1:
-                                content = parts[1].strip()
-                                if content:
-                                    yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]}, ensure_ascii=False)}\n\n"
+                content_sent_len = 0
+                tool_call_search_start = 0
+                tool_call_index = 0
+                TC_OPEN, TC_OPEN_LEN = '<tool_call>', len('<tool_call>')
+
+                THINK_OPEN = ('<think>', '<thinking>')
+                CLOSE = {'<think>': '</think>', '<thinking>': '</thinking>'}
+
+                for token in result:
+                    full_text += token
+
+                    if phase == "pending_think":
+                        hit = [t for t in THINK_OPEN if t in full_text]
+                        if hit:
+                            think_open_tag = min(hit, key=lambda t: full_text.find(t))
+                            thinking_start = full_text.find(think_open_tag) + len(think_open_tag)
+                            phase = "thinking"
+                        elif len(full_text.strip()) > MAX_THINK_WAIT:
+                            phase = "content"          # 确认无 think，正常进 content
+                            content_sent_len = tool_call_search_start = 0
                         else:
-                            yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': text}}]}, ensure_ascii=False)}\n\n"
-                    else:
-                        yield f"data: {json.dumps({'choices': [{'delta': {'content': text}}]}, ensure_ascii=False)}\n\n"
+                            continue
 
-                # Final message
-                _, _, tool_calls = parse_response(full_text)
-                if tool_calls:
-                    yield f"data: {json.dumps({'choices': [{'delta': {'tool_calls': tool_calls}}]}, ensure_ascii=False)}\n\n"
+                    if phase == "thinking":
+                        close = CLOSE[think_open_tag]
+                        if close in full_text:
+                            end = full_text.index(close)
+                            reasoning = full_text[thinking_start:end].strip()
+                            if reasoning and open_thinking:   # 是否下发由 open_thinking 决定
+                                yield (
+                                    f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': reasoning}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                                )
+                            content_sent_len = tool_call_search_start = end + len(close)
+                            phase = "content"
+                        else:
+                            continue
 
-                yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls' if tool_calls else 'stop'}]}, ensure_ascii=False)}\n\n"
+                    # ════════════════════════════════════════════════════════
+                    # Phase: content
+                    #   安全地发送 content，同时监听 <tool_call> 起始
+                    # ════════════════════════════════════════════════════════
+                    if phase == "content":
+                        # 在未发送区域内搜索 <tool_call>
+                        tc_pos = full_text.find(TC_OPEN, tool_call_search_start)
+
+                        if tc_pos == -1:
+                            # 没有 <tool_call>
+                            # 保留末尾 TC_OPEN_LEN-1 字节作为"不安全缓冲"
+                            # 防止 <tool_call> 被 token 边界切断后前半部分误发
+                            safe_end = max(content_sent_len, len(full_text) - (TC_OPEN_LEN - 1))
+                            if safe_end > content_sent_len:
+                                to_send = full_text[content_sent_len: safe_end]
+                                yield (
+                                    f"data: {json.dumps({'choices': [{'delta': {'content': to_send}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                                )
+                                content_sent_len = safe_end
+                            # tool_call_search_start 推进到 safe_end，避免重复搜索已确认无 TC_OPEN 的区域
+                            tool_call_search_start = content_sent_len
+                            continue
+
+                        # 找到 <tool_call>
+                        # 先发送 tc_pos 之前未发送的 content
+                        if tc_pos > content_sent_len:
+                            to_send = full_text[content_sent_len: tc_pos]
+                            yield (
+                                f"data: {json.dumps({'choices': [{'delta': {'content': to_send}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                            )
+                        content_sent_len = tc_pos          # 位置停在 <tool_call> 起始
+                        tool_call_search_start = tc_pos
+                        phase = "tool_call"
+                        # ✅ 不 continue：让本次循环继续走 tool_call 分支
+                        #    处理当前 token 带来的 tool_call 内容
+
+                    # ════════════════════════════════════════════════════════
+                    # Phase: tool_call
+                    #   从 full_text[tool_call_search_start:] 切片，不独立维护 buf
+                    #   等待 </tool_call> 到达后一次性处理
+                    # ════════════════════════════════════════════════════════
+                    if phase == "tool_call":
+                        # 从 full_text 切片，永远不重复追加
+                        tc_slice = full_text[tool_call_search_start:]
+
+                        if '</tool_call>' not in tc_slice:
+                            continue   # tool_call 尚未结束，继续等待
+
+                        # 提取完整的单个 tool_call 块
+                        tc_end_tag = '</tool_call>'
+                        tc_end_pos = tc_slice.index(tc_end_tag) + len(tc_end_tag)
+                        single_tc_raw = tc_slice[:tc_end_pos]
+
+                        # 发送流式 chunks
+                        for chunk in emit_tool_call_stream_chunks(single_tc_raw, tool_call_index):
+                            yield chunk
+                        tool_call_index += 1
+
+                        # 推进 content_sent_len 和 search_start 到该 tool_call 结束位置
+                        abs_tc_end = tool_call_search_start + tc_end_pos
+                        content_sent_len = abs_tc_end
+                        tool_call_search_start = abs_tc_end
+
+                        # 检查紧跟其后是否还有 <tool_call>
+                        after_tc = full_text[abs_tc_end:]
+                        if TC_OPEN in after_tc:
+                            # 定位到下一个 tool_call，保持 phase = "tool_call"
+                            next_tc_rel = after_tc.index(TC_OPEN)
+                            tool_call_search_start = abs_tc_end + next_tc_rel
+                        else:
+                            # 没有更多 tool_call，退回 content phase
+                            phase = "content"
+                            tool_call_search_start = abs_tc_end
+                        continue
+
+                # ── 流结束后：冲刷剩余 content ────────────────────────────────
+                if phase == "content" and content_sent_len < len(full_text):
+                    remaining = full_text[content_sent_len:]
+                    if remaining.strip():
+                        yield (
+                            f"data: {json.dumps({'choices': [{'delta': {'content': remaining}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                        )
+
+                has_tool_calls = tool_call_index > 0
+                finish_reason = "tool_calls" if has_tool_calls else "stop"
+                yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(
