@@ -7,13 +7,12 @@ import json
 import re
 import os
 import sys
-import yaml
 import time
 import uuid
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, Union, Literal
-from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Literal
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -27,11 +26,18 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
-    GenerationConfig
 )
 
-__package__ = "scripts"
+__package__ = "src"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from .configs import (
+    ModelConfig,
+    DeviceConfig,
+    MemoryConfig,
+    ServerConfig,
+    load_config,
+)
 
 # ============================================================================
 # Global Variables & Configuration
@@ -76,14 +82,6 @@ def setup_logging(title: str = "default", log_level: str = "INFO"):
 # ============================================================================
 # Data Models
 # ============================================================================
-
-@dataclass
-class ModelDeviceConfig:
-    """Device configuration for model loading and inference"""
-    device: str = "cuda"
-    dtype: str = "auto"
-    device_map: Optional[str] = None
-    gpus: Optional[List[int]] = None
 
 
 @dataclass
@@ -219,18 +217,18 @@ class ChatRequest(BaseModel):
         return self
 
     def get_generation_params(self) -> Dict[str, Any]:
-        gen_config = config.get('generation', {})
+        gen_config = config.generation
         params = {
-            'temperature': gen_config.get('temperature', 0.7),
-            'top_p': gen_config.get('top_p', 0.92),
-            'top_k': gen_config.get('top_k', 50),
-            'max_tokens': gen_config.get('max_tokens', 8192),
-            'repetition_penalty': gen_config.get('repetition_penalty', 1.0),
-            'num_beams': gen_config.get('num_beams', 1),
-            'do_sample': gen_config.get('do_sample', True),
-            'early_stopping': gen_config.get('early_stopping', False),
-            'no_repeat_ngram_size': gen_config.get('no_repeat_ngram_size', 0),
-        }
+            'temperature': gen_config.temperature,
+            'top_p': gen_config.top_p,
+            'top_k': gen_config.top_k,
+            'max_tokens': gen_config.max_tokens,
+            'repetition_penalty': gen_config.repetition_penalty,
+            'num_beams': gen_config.num_beams,
+            'do_sample': gen_config.do_sample,
+            'early_stopping': gen_config.early_stopping,
+            'no_repeat_ngram_size': gen_config.no_repeat_ngram_size,
+         }
 
         if self.generation_params:
             gen_params_dict = self.generation_params.dict(exclude_unset=True)
@@ -259,11 +257,10 @@ class ChatRequest(BaseModel):
 class MemoryMonitor:
     """Monitor GPU memory and manage KV cache cleanup"""
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config.get('memory', {})
-        self.max_memory_ratio = self.config.get('max_gpu_memory_ratio', 0.8)
-        self.kv_cache_timeout = self.config.get('kv_cache_timeout_minutes', 30)
-        self.cleanup_interval = self.config.get('cleanup_interval', 60)
+    def __init__(self, cfg: MemoryConfig):
+        self.max_memory_ratio = cfg.max_gpu_memory_ratio
+        self.kv_cache_timeout = cfg.kv_cache_timeout_minutes
+        self.cleanup_interval = cfg.cleanup_interval
         self.last_cleanup = time.time()
         self.request_timestamps = {}  # request_id -> last_access_time
 
@@ -365,14 +362,13 @@ class MemoryMonitor:
 class BatchProcessor:
     """Process inference requests in batches"""
 
-    def __init__(self, config: Dict[str, Any], executor: ThreadPoolExecutor):
-        self.config = config.get('batching', {})
-        self.enabled = self.config.get('enabled', True)
-        self.max_batch_size = self.config.get('max_batch_size', 8)
-        self.batch_timeout = self.config.get('batch_timeout_ms', 50) / 1000.0
+    def __init__(self, server_cfg: ServerConfig, executor: ThreadPoolExecutor):
+        self.enabled = server_cfg.batching.enabled
+        self.max_batch_size = server_cfg.batching.max_batch_size
+        self.batch_timeout = server_cfg.batching.batch_timeout_ms / 1000.0
 
         self.executor = executor
-        self.queue = asyncio.Queue(maxsize=config.get('limits', {}).get('max_queue_size', 100))
+        self.queue = asyncio.Queue(maxsize=server_cfg.limits.max_queue_size)
         self.running = False
 
         logger.info(
@@ -389,7 +385,7 @@ class BatchProcessor:
             )
 
             # Wait for result
-            timeout = config.get('server', {}).get('limits', {}).get('request_timeout', 300)
+            timeout = config.server.limits.request_timeout
             result = await asyncio.wait_for(request.future, timeout=timeout)
             return result
 
@@ -664,11 +660,6 @@ class BatchProcessor:
 # Helper Functions
 # ============================================================================
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file"""
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
-
 
 def generate_tool_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:24]}"
@@ -710,103 +701,166 @@ def parse_response(text: str):
     return text.strip(), reasoning_content, tool_calls or None
 
 
+def configure_cuda_precision(device_config: DeviceConfig) -> None:
+    """Configure TF32 and float32 matmul precision when CUDA is available."""
+
+    if device_config.device not in {None, "auto", "cuda"} or not torch.cuda.is_available():
+        return
+
+    torch.backends.cudnn.allow_tf32 = device_config.tf32
+    torch.set_float32_matmul_precision("high" if device_config.tf32 else "highest")
+
+
+def compile_model_if_configured(model: torch.nn.Module, model_config: ModelConfig) -> torch.nn.Module:
+    """Apply torch.compile after distributed wrapping is complete."""
+
+    if model_config.compile_model and hasattr(torch, "compile"):
+        model = torch.compile(model, **model_config.compile_kwargs)
+        logger.info("Applied torch.compile to the model")
+    return model
+
+
 def init_model(
-    model_config: Dict[str, Any],
-    device_config: Union[Dict[str, Any], ModelDeviceConfig]
+    model_cfg: ModelConfig,
+    device_cfg: DeviceConfig,
 ):
-    """Initialize model and tokenizer based on configuration"""
+    """Initialize model and tokenizer — corrected initialization order"""
     global model, tokenizer
 
-    if isinstance(device_config, ModelDeviceConfig):
-        device_config = {
-            'device': device_config.device,
-            'device_map': device_config.device_map,
-            'dtype': device_config.dtype,
-            'gpus': device_config.gpus
-        }
+    logger.info(f"Loading model from {model_cfg.name_or_path}")
 
-    logger.info(f"Loading model from {model_config['name_or_path']}")
+    # ════════════════════════════════════════════════════════════════
+    # Step 1: Build tokenizer kwargs（过滤掉 post-load 设置的字段）
+    # ════════════════════════════════════════════════════════════════
+    POST_LOAD_FIELDS = {"chat_template", "eos_token", "pad_token"}
+    tokenizer_config = model_cfg.tokenizer
+    tokenizer_kwargs = {
+        k: v
+        for k, v in asdict(tokenizer_config).items()
+        if k not in POST_LOAD_FIELDS and v is not None
+    }
 
-    # Load tokenizer
-    tokenizer_kwargs = model_config.get('tokenizer', {})
+    # ════════════════════════════════════════════════════════════════
+    # Step 2: 加载 tokenizer
+    # ════════════════════════════════════════════════════════════════
     tokenizer = AutoTokenizer.from_pretrained(
-        model_config['name_or_path'],
-        trust_remote_code=model_config.get('trust_remote_code', True),
-        **tokenizer_kwargs
+        model_cfg.name_or_path,
+        trust_remote_code=model_cfg.trust_remote_code,
+        **tokenizer_kwargs,
     )
 
-    if tokenizer.pad_token is None:
+    # Step 3: Post-load tokenizer 属性设置
+    if tokenizer_config.chat_template:
+        tokenizer.chat_template = tokenizer_config.chat_template
+    if tokenizer_config.eos_token:
+        tokenizer.eos_token = tokenizer_config.eos_token
+    if tokenizer_config.pad_token:
+        tokenizer.pad_token = tokenizer_config.pad_token
+    elif tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Prepare model loading kwargs
-    model_kwargs = model_config.get('model_kwargs', {})
-    model_kwargs['trust_remote_code'] = model_config.get('trust_remote_code', True)
-    model_kwargs['revision'] = model_config.get('model_revision', "main")
+    logger.info(f"Tokenizer loaded. vocab_size={len(tokenizer)}")
 
-    # Set dtype
-    torch_dtype_str = device_config.get('dtype') or model_config.get('torch_dtype', 'auto')
-    if torch_dtype_str != 'auto':
-        model_kwargs['torch_dtype'] = getattr(torch, torch_dtype_str)
+    # ════════════════════════════════════════════════════════════════
+    # Step 4: 构建 model_kwargs
+    # ════════════════════════════════════════════════════════════════
+    model_kwargs = dict(model_cfg.model_kwargs)
+    model_kwargs["trust_remote_code"] = model_cfg.trust_remote_code
+    model_kwargs["revision"] = model_cfg.model_revision
 
-    # Device mapping
-    if device_config.get('device_map'):
-        model_kwargs['device_map'] = device_config['device_map']
+    # dtype
+    torch_dtype_str = device_cfg.dtype or model_cfg.torch_dtype
+    if torch_dtype_str and torch_dtype_str != "auto":
+        model_kwargs["torch_dtype"] = getattr(torch, torch_dtype_str)
+    else:
+        model_kwargs["torch_dtype"] = "auto"
 
-    # Multi-GPU support
-    if device_config.get('gpus') and not model_kwargs.get('device_map'):
-        gpu_ids = ','.join(map(str, device_config['gpus']))
-        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
-        model_kwargs['device_map'] = 'auto'
+    # attention implementation
+    if model_cfg.attn_implementation:
+        model_kwargs["attn_implementation"] = model_cfg.attn_implementation
 
-    # Quantization
-    quant_config = model_config.get('quantization', {})
-    load_in_8bit = quant_config.get('load_in_8bit', False)
-    load_in_4bit = quant_config.get('load_in_4bit', False)
+    # KV cache
+    if model_cfg.use_cache is not None:
+        model_kwargs["use_cache"] = model_cfg.use_cache
 
-    is_quantized = load_in_8bit or load_in_4bit
+    # ════════════════════════════════════════════════════════════════
+    # Step 5: device_map / GPU 配置（量化时必须用 device_map）
+    # ════════════════════════════════════════════════════════════════
+    quant_cfg = model_cfg.quantization
+    is_quantized = quant_cfg.enabled
 
+    if device_cfg.gpus and not device_cfg.device_map:
+        gpu_ids = ",".join(map(str, device_cfg.gpus))
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        model_kwargs["device_map"] = "auto"
+        logger.info(f"Multi-GPU: CUDA_VISIBLE_DEVICES={gpu_ids}")
+    elif device_cfg.device_map:
+        model_kwargs["device_map"] = device_cfg.device_map
+
+    # ════════════════════════════════════════════════════════════════
+    # Step 6: 量化配置（必须在 from_pretrained 之前确定）
+    # ════════════════════════════════════════════════════════════════
     if is_quantized:
-        model_kwargs['quantization_config'] = BitsAndBytesConfig(
-            load_in_8bit=quant_config.get('load_in_8bit', False),
-            llm_int8_threshold=quant_config.get('llm_int8_threshold', 6.0),
-            llm_int8_skip_modules=quant_config.get('llm_int8_skip_modules', None),
-            llm_int8_enable_fp32_cpu_offload=quant_config.get('llm_int8_enable_fp32_cpu_offload', False),
-            llm_int8_has_fp16_weight=quant_config.get('llm_int8_has_fp16_weight', False),
-            load_in_4bit=quant_config.get('load_in_4bit', False),
-            bnb_4bit_compute_dtype=getattr(
-                torch, quant_config.get('bnb_4bit_compute_dtype', 'bfloat16')
-            ),
-            bnb_4bit_use_double_quant=quant_config.get('bnb_4bit_use_double_quant', True),
-            bnb_4bit_quant_type=quant_config.get('bnb_4bit_quant_type', 'nf4')
+        if not model_kwargs.get("device_map"):
+            # BitsAndBytes 量化必须配合 device_map
+            model_kwargs["device_map"] = "auto"
+            logger.warning("Quantization requires device_map, auto-setting to 'auto'")
+
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=quant_cfg.load_in_8bit,
+            llm_int8_threshold=quant_cfg.llm_int8_threshold,
+            llm_int8_skip_modules=quant_cfg.llm_int8_skip_modules,
+            llm_int8_enable_fp32_cpu_offload=quant_cfg.llm_int8_enable_fp32_cpu_offload,
+            llm_int8_has_fp16_weight=quant_cfg.llm_int8_has_fp16_weight,
+            load_in_4bit=quant_cfg.load_in_4bit,
+            bnb_4bit_compute_dtype=getattr(torch, quant_cfg.bnb_4bit_compute_dtype),
+            bnb_4bit_use_double_quant=quant_cfg.bnb_4bit_use_double_quant,
+            bnb_4bit_quant_type=quant_cfg.bnb_4bit_quant_type,
         )
 
-    if 'use_cache' in model_config:
-        model_kwargs['use_cache'] = model_config['use_cache']
-
-    if model_config.get('attn_implementation'):
-        model_kwargs['attn_implementation'] = model_config['attn_implementation']
-
-    # Load model
+    # ════════════════════════════════════════════════════════════════
+    # Step 7: 加载模型
+    # ════════════════════════════════════════════════════════════════
+    logger.info(f"Loading model with kwargs: { {k: v for k, v in model_kwargs.items() if k != 'quantization_config'} }")
     model = AutoModelForCausalLM.from_pretrained(
-        model_config['name_or_path'],
-        **model_kwargs
+        model_cfg.name_or_path,
+        **model_kwargs,
     )
 
-    # Apply optimizations
-    if model_config.get('apply_liger_kernel', False):
+    # ════════════════════════════════════════════════════════════════
+    # Step 8: 手动 .to(device)（仅在没有 device_map 且未量化时）
+    # ════════════════════════════════════════════════════════════════
+    uses_device_map = bool(model_kwargs.get("device_map"))
+    if not uses_device_map and not is_quantized:
+        if torch.cuda.is_available():
+            target_device = device_cfg.device or "cuda"
+        else:
+            target_device = "cpu"
+            if device_cfg.device and device_cfg.device != "cpu":
+                logger.warning(f"CUDA not available, falling back to CPU (requested: {device_cfg.device})")
+        model = model.to(target_device)
+        logger.info(f"Model moved to device: {target_device}")
+
+    # ════════════════════════════════════════════════════════════════
+    # Step 9: eval 模式（必须在 compile 之前）
+    # ════════════════════════════════════════════════════════════════
+    model.eval()
+
+    # ════════════════════════════════════════════════════════════════
+    # Step 10: Liger Kernel（必须在 compile 之前，from_pretrained 之后）
+    # ════════════════════════════════════════════════════════════════
+    if model_cfg.apply_liger_kernel:
         try:
             from transformers.integrations.liger import apply_liger_kernel
-            kernel_config = model_config.get('kernel_config', {})
-            apply_liger_kernel(model, kernel_config)
+            apply_liger_kernel(model, model_cfg.kernel_config)
             logger.info("Applied Liger Kernel optimizations")
         except ImportError:
             logger.warning("liger_kernel not installed, skipping optimization")
 
-    if not device_config.get('device_map') and not is_quantized:
-        device = device_config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-        model = model.to(device)
-
-    model.eval()
+    # ════════════════════════════════════════════════════════════════
+    # Step 11: torch.compile（必须最后执行，且需检查兼容性）
+    # ════════════════════════════════════════════════════════════════
+    model = compile_model_if_configured(model, model_cfg)
 
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model loaded successfully. Total parameters: {total_params / 1e6:.2f}M")
@@ -889,10 +943,10 @@ async def lifespan(app: FastAPI):
     inference_executor = ThreadPoolExecutor(max_workers=1)  # Single worker for thread safety
 
     # Initialize memory monitor
-    memory_monitor = MemoryMonitor(config)
+    memory_monitor = MemoryMonitor(config.memory)
 
     # Initialize batch processor
-    batch_processor = BatchProcessor(config.get('server', {}), inference_executor)
+    batch_processor = BatchProcessor(config.server, inference_executor)
 
     # Start background tasks
     batch_task = asyncio.create_task(batch_processor.process_loop())
@@ -1179,10 +1233,10 @@ def list_models():
         "object": "list",
         "data": [
             {
-                "id": config.get('model', {}).get('name', 'default'),
+                "id": config.model.name,
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": config.get('title', 'default')
+                "owned_by": config.title,
             }
         ]
     }
@@ -1235,13 +1289,7 @@ if __name__ == "__main__":
         description="LLMs API Server - Production Ready"
     )
 
-    parser.add_argument(
-        '--config',
-        default='config/production.yaml',
-        type=str,
-        help="Path to YAML configuration file"
-    )
-
+    parser.add_argument('--config', default='config/production.yaml', type=str, help="Path to YAML configuration file")
     parser.add_argument('--device', type=str, help="Override device")
     parser.add_argument('--dtype', type=str, help="Override dtype")
     parser.add_argument('--gpus', type=str, help="Comma-separated GPU IDs")
@@ -1255,35 +1303,32 @@ if __name__ == "__main__":
     config = load_config(args.config)
 
     # Setup logging
-    log_level = args.log_level or config.get('server', {}).get('log_level', 'info')
-    setup_logging(config.get('title', 'default'), log_level)
+    log_level = args.log_level or config.server.log_level
+    setup_logging(config.title, log_level)
 
     # Override config with CLI args
-    model_config = config.get('model', {})
-    device_config = config.get('device', {})
-    server_config = config.get('server', {})
-
     if args.device:
-        device_config['device'] = args.device
+        config.device.device = args.device
     if args.dtype:
-        device_config['dtype'] = args.dtype
+        config.device.dtype = args.dtype
     if args.gpus:
-        device_config['gpus'] = [int(g) for g in args.gpus.split(',')]
+        config.device.gpus = [int(g) for g in args.gpus.split(',')]
 
-    host = args.host or server_config.get('host', '0.0.0.0')
-    port = args.port or server_config.get('port', 8998)
+    host = args.host or config.server.host
+    port = args.port or config.server.port
 
     # Initialize model
     logger.info("Initializing model...")
-    model, tokenizer = init_model(model_config, device_config)
+    configure_cuda_precision(config.device)
+    model, tokenizer = init_model(config.model, config.device)
 
     # Start server
     uvicorn_config = {
         'app': app,
         'host': host,
         'port': port,
-        'log_level': log_level.lower(),
-        'timeout_keep_alive': server_config.get('timeout_keep_alive', 5),
+        'log_level': config.server.log_level.lower(),
+        'timeout_keep_alive': config.server.timeout_keep_alive,
     }
 
     logger.info(f"Starting server on {host}:{port}")
