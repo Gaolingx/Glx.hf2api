@@ -49,7 +49,7 @@ memory_monitor = None
 # Logging Setup
 # ============================================================================
 
-def setup_logging(log_level: str = "INFO"):
+def setup_logging(title: str = "default", log_level: str = "INFO"):
     """Setup structured logging with configurable level"""
     global logger
 
@@ -61,7 +61,7 @@ def setup_logging(log_level: str = "INFO"):
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    logger = logging.getLogger("minimind")
+    logger = logging.getLogger(title)
     logger.setLevel(numeric_level)
 
     # Suppress transformers warnings unless debug mode
@@ -675,17 +675,19 @@ def init_model(
     # Quantization
     quant_config = model_config.get('quantization', None)
     if quant_config:
-        if quant_config.get('load_in_8bit', False):
-            model_kwargs['load_in_8bit'] = True
-        elif quant_config.get('load_in_4bit', False):
-            model_kwargs['quantization_config'] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=getattr(
-                    torch, quant_config.get('bnb_4bit_compute_dtype', 'float16')
-                ),
-                bnb_4bit_use_double_quant=quant_config.get('bnb_4bit_use_double_quant', True),
-                bnb_4bit_quant_type=quant_config.get('bnb_4bit_quant_type', 'nf4')
-            )
+        model_kwargs['quantization_config'] = BitsAndBytesConfig(
+            load_in_8bit=quant_config.get('load_in_8bit', False),
+            llm_int8_threshold=quant_config.get('llm_int8_threshold', 6.0),
+            llm_int8_skip_modules=quant_config.get('llm_int8_skip_modules', None),
+            llm_int8_enable_fp32_cpu_offload=quant_config.get('llm_int8_enable_fp32_cpu_offload', False),
+            llm_int8_has_fp16_weight=quant_config.get('llm_int8_has_fp16_weight', False),
+            load_in_4bit=quant_config.get('load_in_4bit', False),
+            bnb_4bit_compute_dtype=getattr(
+                torch, quant_config.get('bnb_4bit_compute_dtype', 'bfloat16')
+            ),
+            bnb_4bit_use_double_quant=quant_config.get('bnb_4bit_use_double_quant', True),
+            bnb_4bit_quant_type=quant_config.get('bnb_4bit_quant_type', 'nf4')
+        )
 
     if 'use_cache' in model_config:
         model_kwargs['use_cache'] = model_config['use_cache']
@@ -709,10 +711,12 @@ def init_model(
         except ImportError:
             logger.warning("liger_kernel not installed, skipping optimization")
 
-    is_quantized = (
-            model_kwargs.get('load_in_8bit', False) or
-            'quantization_config' in model_kwargs
-    )
+    is_quantized = False
+    if quant_config:
+        is_quantized = (
+            quant_config.get('load_in_8bit', False) or
+            quant_config.get('load_in_4bit', False)
+        )
 
     if not device_config.get('device_map') and not is_quantized:
         device = device_config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -910,7 +914,7 @@ def list_models():
                 "id": config.get('model', {}).get('name', 'default'),
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": "minimind"
+                "owned_by": config.get('title', 'default')
             }
         ]
     }
@@ -960,7 +964,7 @@ request_queue_size {batch_processor.queue.qsize() if batch_processor else 0}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="MiniMind Server - Production Ready"
+        description="LLMs API Server - Production Ready"
     )
 
     parser.add_argument(
@@ -984,7 +988,7 @@ if __name__ == "__main__":
 
     # Setup logging
     log_level = args.log_level or config.get('server', {}).get('log_level', 'info')
-    setup_logging(log_level)
+    setup_logging(config.get('title', 'default'), log_level)
 
     # Override config with CLI args
     model_config = config.get('model', {})
