@@ -673,8 +673,13 @@ def init_model(
         model_kwargs['device_map'] = 'auto'
 
     # Quantization
-    quant_config = model_config.get('quantization', None)
-    if quant_config:
+    quant_config = model_config.get('quantization', {})
+    load_in_8bit = quant_config.get('load_in_8bit', False)
+    load_in_4bit = quant_config.get('load_in_4bit', False)
+
+    is_quantized = load_in_8bit or load_in_4bit
+
+    if is_quantized:
         model_kwargs['quantization_config'] = BitsAndBytesConfig(
             load_in_8bit=quant_config.get('load_in_8bit', False),
             llm_int8_threshold=quant_config.get('llm_int8_threshold', 6.0),
@@ -710,13 +715,6 @@ def init_model(
             logger.info("Applied Liger Kernel optimizations")
         except ImportError:
             logger.warning("liger_kernel not installed, skipping optimization")
-
-    is_quantized = False
-    if quant_config:
-        is_quantized = (
-            quant_config.get('load_in_8bit', False) or
-            quant_config.get('load_in_4bit', False)
-        )
 
     if not device_config.get('device_map') and not is_quantized:
         device = device_config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
