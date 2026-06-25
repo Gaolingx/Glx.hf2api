@@ -1,0 +1,69 @@
+# MiniMind Server Configuration
+
+model:
+  name: "Qwen3"
+  name_or_path: "E:/model/Qwen3-4B"
+  trust_remote_code: true
+  torch_dtype: "bfloat16"
+  use_cache: true
+  attn_implementation: "sdpa"
+  use_flash_attention_2: false
+  apply_liger_kernel: true
+  
+  tokenizer:
+    padding_side: "left"
+    truncation_side: "left"
+  
+  model_kwargs: {}
+  
+  quantization:
+    load_in_8bit: false
+    load_in_4bit: false
+    bnb_4bit_compute_dtype: "bfloat16"
+    bnb_4bit_use_double_quant: true
+    bnb_4bit_quant_type: "nf4"
+  
+  kernel_config:
+    rope: true
+    rms_norm: true
+    swiglu: true
+
+device:
+  device: "cuda"
+  dtype: "bfloat16"
+  device_map: null
+  gpus: null  # [0, 1] for multi-GPU
+
+server:
+  host: "0.0.0.0"
+  port: 8998
+  workers: 1
+  log_level: "info"
+  limit_concurrency: null
+  timeout_keep_alive: 5
+
+# Default generation configuration
+generation:
+  # Core sampling parameters
+  temperature: 0.7
+  top_p: 0.92
+  top_k: 50
+  
+  # Output control
+  max_tokens: 8192
+  max_new_tokens: 2048
+  
+  # Repetition control
+  repetition_penalty: 1.0
+  no_repeat_ngram_size: 0
+  
+  # Decoding strategy
+  do_sample: true
+  num_beams: 1
+  early_stopping: false
+  
+  # EOS token configuration
+  eos_token_id: null  # null uses model default, or specify list [2, 3]
+  
+  # External GenerationConfig path
+  generation_config_path: null  # "path/to/generation_config.json"
