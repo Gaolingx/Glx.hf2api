@@ -991,49 +991,59 @@ async def chat_completions(request: ChatRequest):
             async def stream_generator():
                 """Async generator for streaming response"""
                 full_text = ""
+                #
+                # 设计原则：
+                #   - full_text 是唯一的追加目标，所有 phase 从 full_text 读取
+                #   - content_sent_len 追踪 full_text 中已安全发送的字符位置
+                #   - tool_call_buf 不再独立追加 token，始终从 full_text 切片
+                #   - phase 切换后用 continue 保证当前 token 不被二次处理
+                #
                 open_thinking = request.get_open_thinking()
+                phase = "thinking" if open_thinking else "content"
 
-                phase = "pending_think"
-                think_open_tag = None
-                thinking_start = 0
-                MAX_THINK_WAIT = 50
-
+                # content_sent_len: full_text[:content_sent_len] 已发送给客户端
                 content_sent_len = 0
+                # thinking_start: <thinking>/<think> 起始位置（含标签）
+                thinking_start = 0
+                # tool_call_search_start: 在 full_text 中搜索下一个 <tool_call> 的起始位置
                 tool_call_search_start = 0
                 tool_call_index = 0
-                TC_OPEN, TC_OPEN_LEN = '<tool_call>', len('<tool_call>')
 
-                THINK_OPEN = ('<think>', '<thinking>')
-                CLOSE = {'<think>': '</think>', '<thinking>': '</thinking>'}
+                # ── TOOL_CALL_OPEN_TAG 长度常量，用于防止把未完整到达的标签当 content 发出 ──
+                TC_OPEN = '<tool_call>'
+                TC_OPEN_LEN = len(TC_OPEN)
 
                 for token in result:
-                    full_text += token
+                    full_text += token          # 唯一追加点
 
-                    if phase == "pending_think":
-                        hit = [t for t in THINK_OPEN if t in full_text]
-                        if hit:
-                            think_open_tag = min(hit, key=lambda t: full_text.find(t))
-                            thinking_start = full_text.find(think_open_tag) + len(think_open_tag)
-                            phase = "thinking"
-                        elif len(full_text.strip()) > MAX_THINK_WAIT:
-                            phase = "content"          # 确认无 think，正常进 content
-                            content_sent_len = tool_call_search_start = 0
-                        else:
-                            continue
-
+                    # ════════════════════════════════════════════════════════
+                    # Phase: thinking
+                    #   等待 </thinking> 或 </think>，期间不向客户端发送任何内容
+                    # ════════════════════════════════════════════════════════
                     if phase == "thinking":
-                        close = CLOSE[think_open_tag]
-                        if close in full_text:
-                            end = full_text.index(close)
-                            reasoning = full_text[thinking_start:end].strip()
-                            if reasoning and open_thinking:   # 是否下发由 open_thinking 决定
+                        end_tag = None
+                        if '</thinking>' in full_text:
+                            end_tag = '</thinking>'
+                        elif '</think>' in full_text:
+                            end_tag = '</think>'
+
+                        if end_tag is not None:
+                            end_pos = full_text.index(end_tag)
+                            # 去掉开始标签，提取纯推理文本
+                            raw_thinking = full_text[thinking_start: end_pos]
+                            reasoning = re.sub(r'</?think(?:ing)?>',  '', raw_thinking).strip()
+                            if reasoning:
                                 yield (
                                     f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': reasoning}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
                                 )
-                            content_sent_len = tool_call_search_start = end + len(close)
+                            # content 从 end_tag 之后开始
+                            content_sent_len = end_pos + len(end_tag)
+                            tool_call_search_start = content_sent_len
                             phase = "content"
+                            # ✅ 不 continue：让本次循环继续走 content 分支
+                            #    处理 after 部分（end_tag 之后已到达的字符）
                         else:
-                            continue
+                            continue   # 还在 thinking 中，继续等待
 
                     # ════════════════════════════════════════════════════════
                     # Phase: content
