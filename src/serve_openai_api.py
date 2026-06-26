@@ -181,7 +181,7 @@ class ChatRequest(BaseModel):
         """
         # pending: 已发出但尚未被 tool 消费的 call_id
         # consumed: 已被 tool 消费的 call_id（不允许重复消费）
-        pending: Dict[str, int] = {}   # call_id -> messages index（便于错误定位）
+        pending: Dict[str, int] = {}  # call_id -> messages index（便于错误定位）
         consumed: set = set()
 
         for i, msg in enumerate(self.messages):
@@ -228,7 +228,7 @@ class ChatRequest(BaseModel):
             'do_sample': gen_config.do_sample,
             'early_stopping': gen_config.early_stopping,
             'no_repeat_ngram_size': gen_config.no_repeat_ngram_size,
-         }
+        }
 
         if self.generation_params:
             gen_params_dict = self.generation_params.dict(exclude_unset=True)
@@ -637,18 +637,39 @@ class BatchProcessor:
             'streamer': streamer,
         }
 
-        # Start generation in separate thread
-        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        # Shared exception holder for propagating fatal errors from generation thread
+        gen_error: Dict[str, Any] = {"exc": None}
+
+        def _safe_generate():
+            """Run model.generate with error capture and guaranteed streamer cleanup."""
+            try:
+                model.generate(**generation_kwargs)
+            except Exception as e:
+                gen_error["exc"] = e
+                logger.error(f"Generation thread error: {e}", exc_info=True)
+            finally:
+                # Always signal streamer end so the consumer iterator does not
+                # block forever on queue.get() when generation fails mid-stream.
+                try:
+                    streamer.end()
+                except Exception:
+                    pass
+
+        # daemon=True so the process can exit on Ctrl+C even if generation is stuck
+        thread = Thread(target=_safe_generate, daemon=True)
         thread.start()
 
-        # Yield tokens
+        # Yield tokens; propagate any fatal error (e.g. CUDA OOM) after stream ends
         full_text = ""
-        for text in streamer:
-            full_text += text
-            yield text
-
-        thread.join()
-        memory_monitor.track_request(request.request_id)
+        try:
+            for text in streamer:
+                full_text += text
+                yield text
+        finally:
+            thread.join(timeout=10.0)
+            memory_monitor.track_request(request.request_id)
+            if gen_error["exc"] is not None:
+                raise gen_error["exc"]
 
     async def stop(self):
         """Stop processing loop"""
@@ -673,9 +694,10 @@ def parse_response(text: str):
         re.DOTALL
     )
     reasoning_parts = []
+
     def _collect_thinking(m: re.Match) -> str:
         reasoning_parts.append(m.group(2).strip())
-        return ''   # 替换为空字符串，从 text 中移除
+        return ''  # 替换为空字符串，从 text 中移除
 
     text = THINK_PATTERN.sub(_collect_thinking, text)
     reasoning_content = '\n'.join(reasoning_parts) if reasoning_parts else None
@@ -709,15 +731,6 @@ def configure_cuda_precision(device_config: DeviceConfig) -> None:
 
     torch.backends.cudnn.allow_tf32 = device_config.tf32
     torch.set_float32_matmul_precision("high" if device_config.tf32 else "highest")
-
-
-def compile_model_if_configured(model: torch.nn.Module, model_config: ModelConfig) -> torch.nn.Module:
-    """Apply torch.compile after distributed wrapping is complete."""
-
-    if model_config.compile_model and hasattr(torch, "compile"):
-        model = torch.compile(model, **model_config.compile_kwargs)
-        logger.info("Applied torch.compile to the model")
-    return model
 
 
 def init_model(
@@ -856,11 +869,6 @@ def init_model(
             logger.info("Applied Liger Kernel optimizations")
         except ImportError:
             logger.warning("liger_kernel not installed, skipping optimization")
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 11: torch.compile（必须最后执行，且需检查兼容性）
-    # ════════════════════════════════════════════════════════════════
-    model = compile_model_if_configured(model, model_cfg)
 
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model loaded successfully. Total parameters: {total_params / 1e6:.2f}M")
@@ -1045,13 +1053,6 @@ async def chat_completions(request: ChatRequest):
             async def stream_generator():
                 """Async generator for streaming response"""
                 full_text = ""
-                #
-                # 设计原则：
-                #   - full_text 是唯一的追加目标，所有 phase 从 full_text 读取
-                #   - content_sent_len 追踪 full_text 中已安全发送的字符位置
-                #   - tool_call_buf 不再独立追加 token，始终从 full_text 切片
-                #   - phase 切换后用 continue 保证当前 token 不被二次处理
-                #
                 open_thinking = request.get_open_thinking()
                 phase = "thinking" if open_thinking else "content"
 
@@ -1067,8 +1068,23 @@ async def chat_completions(request: ChatRequest):
                 TC_OPEN = '<tool_call>'
                 TC_OPEN_LEN = len(TC_OPEN)
 
-                for token in result:
-                    full_text += token          # 唯一追加点
+                gen_error_stream = None
+
+                while True:
+                    try:
+                        # asyncio.to_thread prevents blocking the event loop while
+                        # waiting for the next token; this keeps Ctrl+C responsive
+                        # and allows the async generator to be cancelled by Starlette
+                        # on client disconnect.
+                        token = await asyncio.to_thread(next, result, None)
+                    except Exception as e:
+                        # Fatal error from the generation thread (e.g. CUDA OOM)
+                        # propagated through the sync generator's finally-raise.
+                        gen_error_stream = e
+                        break
+                    if token is None:
+                        break
+                    full_text += token
 
                     # ════════════════════════════════════════════════════════
                     # Phase: thinking
@@ -1085,7 +1101,7 @@ async def chat_completions(request: ChatRequest):
                             end_pos = full_text.index(end_tag)
                             # 去掉开始标签，提取纯推理文本
                             raw_thinking = full_text[thinking_start: end_pos]
-                            reasoning = re.sub(r'</?think(?:ing)?>',  '', raw_thinking).strip()
+                            reasoning = re.sub(r'</?think(?:ing)?>', '', raw_thinking).strip()
                             if reasoning:
                                 yield (
                                     f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': reasoning}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
@@ -1097,7 +1113,7 @@ async def chat_completions(request: ChatRequest):
                             # ✅ 不 continue：让本次循环继续走 content 分支
                             #    处理 after 部分（end_tag 之后已到达的字符）
                         else:
-                            continue   # 还在 thinking 中，继续等待
+                            continue  # 还在 thinking 中，继续等待
 
                     # ════════════════════════════════════════════════════════
                     # Phase: content
@@ -1129,7 +1145,7 @@ async def chat_completions(request: ChatRequest):
                             yield (
                                 f"data: {json.dumps({'choices': [{'delta': {'content': to_send}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
                             )
-                        content_sent_len = tc_pos          # 位置停在 <tool_call> 起始
+                        content_sent_len = tc_pos  # 位置停在 <tool_call> 起始
                         tool_call_search_start = tc_pos
                         phase = "tool_call"
                         # ✅ 不 continue：让本次循环继续走 tool_call 分支
@@ -1145,7 +1161,7 @@ async def chat_completions(request: ChatRequest):
                         tc_slice = full_text[tool_call_search_start:]
 
                         if '</tool_call>' not in tc_slice:
-                            continue   # tool_call 尚未结束，继续等待
+                            continue  # tool_call 尚未结束，继续等待
 
                         # 提取完整的单个 tool_call 块
                         tc_end_tag = '</tool_call>'
@@ -1173,6 +1189,21 @@ async def chat_completions(request: ChatRequest):
                             phase = "content"
                             tool_call_search_start = abs_tc_end
                         continue
+
+                # ── 生成过程中出现致命错误（如 CUDA OOM），通知客户端 ──────────
+                if gen_error_stream is not None:
+                    logger.error(
+                        f"Streaming generation error: {gen_error_stream}",
+                        exc_info=True,
+                    )
+                    yield (
+                        f"data: {json.dumps({'error': {'message': str(gen_error_stream), 'type': 'internal_error'}}, ensure_ascii=False)}\n\n"
+                    )
+                    yield (
+                        f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'error'}]}, ensure_ascii=False)}\n\n"
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
 
                 # ── 流结束后：冲刷剩余 content ────────────────────────────────
                 if phase == "content" and content_sent_len < len(full_text):

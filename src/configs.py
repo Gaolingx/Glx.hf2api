@@ -48,8 +48,6 @@ class ModelConfig:
     use_cache: Optional[bool] = None
     attn_implementation: Optional[str] = None
     apply_liger_kernel: bool = False
-    compile_model: bool = False
-    compile_kwargs: dict[str, Any] = field(default_factory=dict)
     kernel_config: Dict[str, Any] = field(default_factory=dict)
     model_kwargs: Dict[str, Any] = field(default_factory=dict)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
