@@ -27,14 +27,14 @@ from .utils import MemoryMonitor, setup_logging
 
 logger = logging.getLogger(__name__)
 
-# ── 全局单例（仅 server.py 持有） ──────────────────────────────────────
+# ── 全局单例（仅 server.py 持有） ───────────────────────────────────────
 _engine: InferenceEngine | None = None
 _queue: RequestQueue | None = None
 _monitor: MemoryMonitor | None = None
 _config = None
 
 
-# ── Lifespan ────────────────────────────────────────────────────────────
+# ── Lifespan ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,10 +46,8 @@ async def lifespan(app: FastAPI):
     _queue = RequestQueue(_engine, _config.server)
     _queue.start()
 
-    # 注册中间件（需在第一个请求前完成）
-    app.add_middleware(MemoryCheckMiddleware, monitor=_monitor)
-
-    cleanup_task = __import__("asyncio").ensure_future(_monitor.run_cleanup_loop())
+    import asyncio
+    cleanup_task = asyncio.ensure_future(_monitor.run_cleanup_loop())
 
     logger.info("Server ready.")
     yield
@@ -60,10 +58,16 @@ async def lifespan(app: FastAPI):
     logger.info("Server stopped.")
 
 
+# ── App 创建：中间件在此处注册，通过 lambda 延迟访问 _monitor ─────────────
+
 app = FastAPI(lifespan=lifespan)
 
+# lambda 捕获模块级变量名，每次调用时才读取 _monitor 的当前值
+# lifespan 启动后 _monitor 被赋值，中间件即可正常使用
+app.add_middleware(MemoryCheckMiddleware, monitor_getter=lambda: _monitor)
 
-# ── 路由 ────────────────────────────────────────────────────────────────
+
+# ── 路由 ──────────────────────────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
@@ -90,7 +94,7 @@ async def chat_completions(request: ChatRequest):
 
         result = await _queue.enqueue(inference_req)
 
-        # ── 流式响应 ─────────────────────────────────────────────────
+        # ── 流式响应 ──────────────────────────────────────────────────
         if request.stream:
             handler = StreamHandler(open_thinking=request.get_open_thinking())
 
@@ -100,7 +104,7 @@ async def chat_completions(request: ChatRequest):
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-        # ── 非流式响应 ───────────────────────────────────────────────
+        # ── 非流式响应 ────────────────────────────────────────────────
         message: dict = {"role": "assistant", "content": result.content}
         if result.reasoning_content:
             message["reasoning_content"] = result.reasoning_content
@@ -170,10 +174,10 @@ def metrics():
     )
 
 
-# ── 工具函数 ─────────────────────────────────────────────────────────────
+# ── 工具函数 ──────────────────────────────────────────────────────────────
 
 def _compute_usage(req: InferenceRequest, result) -> dict:
-    """计算实际 token 用量（需要 tokenizer 可访问）。"""
+    """计算实际 token 用量。"""
     try:
         tok = _engine.tokenizer
         prompt_text = tok.apply_chat_template(
@@ -191,7 +195,7 @@ def _compute_usage(req: InferenceRequest, result) -> dict:
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
-# ── 主入口 ───────────────────────────────────────────────────────────────
+# ── 主入口 ────────────────────────────────────────────────────────────────
 
 def main():
     global _engine, _config
