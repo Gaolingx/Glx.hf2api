@@ -1,1366 +1,239 @@
 """
-LLMs API Server - Supports streaming, concurrency, KV cache, multi-device, and optimizations
+服务入口：FastAPI app 定义、路由、lifespan。
+全局状态仅在此文件维护，其他模块通过参数传递依赖。
 """
+from __future__ import annotations
 
 import argparse
-import json
-import re
 import os
+import logging
 import sys
 import time
-import uuid
-import asyncio
-import logging
-from typing import Optional, Dict, Any, List, Literal
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
 
-import torch
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-)
 
 __package__ = "src"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from .configs import (
-    ModelConfig,
-    DeviceConfig,
-    MemoryConfig,
-    ServerConfig,
-    load_config,
-)
-
-# ============================================================================
-# Global Variables & Configuration
-# ============================================================================
-
-model = None
-tokenizer = None
-config = None
-logger = None
-inference_executor = None  # ThreadPoolExecutor for model inference
-batch_processor = None
-memory_monitor = None
-
-
-# ============================================================================
-# Logging Setup
-# ============================================================================
-
-def setup_logging(title: str = "default", log_level: str = "INFO"):
-    """Setup structured logging with configurable level"""
-    global logger
-
-    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
-
-    logging.basicConfig(
-        level=numeric_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-
-    logger = logging.getLogger(title)
-    logger.setLevel(numeric_level)
-
-    # Suppress transformers warnings unless debug mode
-    if numeric_level > logging.DEBUG:
-        logging.getLogger("transformers").setLevel(logging.ERROR)
-        logging.getLogger("torch").setLevel(logging.ERROR)
-
-    return logger
-
-
-# ============================================================================
-# Data Models
-# ============================================================================
-
-
-@dataclass
-class InferenceRequest:
-    """Internal request object for batching"""
-    request_id: str
-    messages: List[dict]
-    gen_params: Dict[str, Any]
-    tools: Optional[List] = None
-    open_thinking: bool = False
-    stream: bool = False
-    future: asyncio.Future = field(default_factory=lambda: asyncio.Future())
-    created_at: float = field(default_factory=time.time)
-
-
-class GenerationParams(BaseModel):
-    """Generation parameters"""
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.92, ge=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=0)
-    max_tokens: Optional[int] = Field(default=None, ge=1)
-    repetition_penalty: float = Field(default=1.0, ge=1.0)
-    num_beams: int = Field(default=1, ge=1)
-    do_sample: bool = True
-    early_stopping: bool = False
-    no_repeat_ngram_size: int = Field(default=0, ge=0)
-
-
-class FunctionCall(BaseModel):
-    name: str
-    arguments: str  # JSON string
-
-
-class ToolCall(BaseModel):
-    id: str
-    type: Literal["function"] = "function"
-    function: FunctionCall
-
-
-class Message(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
-    content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = None
-    tool_call_id: Optional[str] = None
-    reasoning_content: Optional[str] = None
-
-    @model_validator(mode='after')
-    def validate_role_constraints(self):
-        if self.role == "tool":
-            if not self.tool_call_id:
-                raise ValueError("tool message must have tool_call_id")
-            if not self.content:
-                raise ValueError("tool message must have content")
-        if self.role == "assistant":
-            if self.tool_calls and self.content and self.content.strip():
-                # assistant 同时有 tool_calls 和 content 是允许的，但记录警告
-                pass
-        return self
-
-
-class ChatRequest(BaseModel):
-    """OpenAI-compatible chat completion request"""
-    model: str
-    messages: List[Message]
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    max_tokens: Optional[int] = None
-    repetition_penalty: Optional[float] = None
-    num_beams: Optional[int] = None
-    do_sample: Optional[bool] = None
-    stream: bool = False
-    tools: list = []
-    open_thinking: bool = False
-    chat_template_kwargs: Optional[dict] = None
-    generation_params: Optional[GenerationParams] = None
-
-    def get_open_thinking(self) -> bool:
-        if self.open_thinking:
-            return True
-        if self.chat_template_kwargs:
-            return (
-                    self.chat_template_kwargs.get('open_thinking', False) or
-                    self.chat_template_kwargs.get('enable_thinking', False)
-            )
-        return False
-
-    @model_validator(mode='after')
-    def validate_tool_call_references(self):
-        """
-        校验 tool message 的 tool_call_id 必须有对应且尚未被消费的 assistant tool_call。
-
-        多轮对话中同一 id 不应跨轮复用：
-          Round1: assistant(call_A) -> tool(call_A)   # call_A 已消费
-          Round2: assistant(call_B) -> tool(call_B)   # call_B 已消费
-          ❌ tool(call_A) 出现第二次 -> 报错
-        """
-        # pending: 已发出但尚未被 tool 消费的 call_id
-        # consumed: 已被 tool 消费的 call_id（不允许重复消费）
-        pending: Dict[str, int] = {}  # call_id -> messages index（便于错误定位）
-        consumed: set = set()
-
-        for i, msg in enumerate(self.messages):
-            if msg.role == "assistant" and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    if tc.id in consumed:
-                        raise ValueError(
-                            f"messages[{i}]: tool_call_id '{tc.id}' was already consumed "
-                            f"by a previous tool message. IDs must be unique across turns."
-                        )
-                    pending[tc.id] = i
-
-            elif msg.role == "tool":
-                tid = msg.tool_call_id
-                if tid in consumed:
-                    raise ValueError(
-                        f"messages[{i}]: tool_call_id '{tid}' has already been consumed "
-                        f"by a previous tool message."
-                    )
-                if tid not in pending:
-                    raise ValueError(
-                        f"messages[{i}]: tool_call_id '{tid}' has no matching "
-                        f"assistant tool_call. Pending IDs: {set(pending.keys())}"
-                    )
-                consumed.add(tid)
-                del pending[tid]
-
-        # 流程结束后 pending 非空说明有未被响应的 tool_call（允许，最后一轮可以尚未执行）
-        # 不报错，只记录 debug 信息
-        if pending:
-            logger.debug(f"Unresolved tool_calls at end of messages: {set(pending.keys())}")
-
-        return self
-
-    def get_generation_params(self) -> Dict[str, Any]:
-        gen_config = config.generation
-        params = {
-            'temperature': gen_config.temperature,
-            'top_p': gen_config.top_p,
-            'top_k': gen_config.top_k,
-            'max_tokens': gen_config.max_tokens,
-            'repetition_penalty': gen_config.repetition_penalty,
-            'num_beams': gen_config.num_beams,
-            'do_sample': gen_config.do_sample,
-            'early_stopping': gen_config.early_stopping,
-            'no_repeat_ngram_size': gen_config.no_repeat_ngram_size,
-        }
-
-        if self.generation_params:
-            gen_params_dict = self.generation_params.dict(exclude_unset=True)
-            params.update(gen_params_dict)
-
-        direct_params = {
-            'temperature': self.temperature,
-            'top_p': self.top_p,
-            'top_k': self.top_k,
-            'max_tokens': self.max_tokens,
-            'repetition_penalty': self.repetition_penalty,
-            'num_beams': self.num_beams,
-            'do_sample': self.do_sample,
-        }
-        for key, value in direct_params.items():
-            if value is not None:
-                params[key] = value
-
-        return params
-
-
-# ============================================================================
-# Memory Monitor
-# ============================================================================
-
-class MemoryMonitor:
-    """Monitor GPU memory and manage KV cache cleanup"""
-
-    def __init__(self, cfg: MemoryConfig):
-        self.max_memory_ratio = cfg.max_gpu_memory_ratio
-        self.kv_cache_timeout = cfg.kv_cache_timeout_minutes
-        self.cleanup_interval = cfg.cleanup_interval
-        self.last_cleanup = time.time()
-        self.request_timestamps = {}  # request_id -> last_access_time
-
-        logger.info(
-            f"MemoryMonitor initialized: max_ratio={self.max_memory_ratio}, "
-            f"kv_timeout={self.kv_cache_timeout}min"
-        )
-
-    def check_memory_available(self) -> bool:
-        """Check if GPU memory is available"""
-        if not torch.cuda.is_available():
-            return True
-
-        try:
-            device = torch.cuda.current_device()
-            total_memory = torch.cuda.get_device_properties(device).total_memory
-            allocated_memory = torch.cuda.memory_allocated(device)
-            memory_ratio = allocated_memory / total_memory
-
-            available = memory_ratio < self.max_memory_ratio
-
-            if not available:
-                logger.warning(
-                    f"GPU memory threshold exceeded: {memory_ratio:.2%} "
-                    f"(max: {self.max_memory_ratio:.2%})"
-                )
-
-            return available
-        except Exception as e:
-            logger.error(f"Error checking GPU memory: {e}")
-            return True  # Fail open
-
-    def get_memory_stats(self) -> Dict[str, float]:
-        """Get current memory statistics"""
-        if not torch.cuda.is_available():
-            return {}
-
-        try:
-            device = torch.cuda.current_device()
-            total = torch.cuda.get_device_properties(device).total_memory / 1e9
-            allocated = torch.cuda.memory_allocated(device) / 1e9
-            cached = torch.cuda.memory_reserved(device) / 1e9
-
-            return {
-                "total_gb": round(total, 2),
-                "allocated_gb": round(allocated, 2),
-                "cached_gb": round(cached, 2),
-                "ratio": round(allocated / total, 3)
-            }
-        except Exception as e:
-            logger.error(f"Error getting memory stats: {e}")
-            return {}
-
-    def cleanup_cache(self, force: bool = False):
-        """Clean up KV cache and GPU memory"""
-        current_time = time.time()
-
-        # Check if cleanup is needed
-        if not force and (current_time - self.last_cleanup) < self.cleanup_interval:
-            return
-
-        logger.info("Starting cache cleanup...")
-
-        # Remove old request timestamps
-        timeout_seconds = self.kv_cache_timeout * 60
-        expired_requests = [
-            req_id for req_id, timestamp in self.request_timestamps.items()
-            if (current_time - timestamp) > timeout_seconds
-        ]
-
-        for req_id in expired_requests:
-            del self.request_timestamps[req_id]
-
-        if expired_requests:
-            logger.info(f"Cleaned up {len(expired_requests)} expired request records")
-
-        # Clear PyTorch cache
-        if torch.cuda.is_available():
-            before_stats = self.get_memory_stats()
-            torch.cuda.empty_cache()
-            after_stats = self.get_memory_stats()
-
-            logger.info(
-                f"GPU cache cleared: {before_stats.get('cached_gb', 0):.2f}GB -> "
-                f"{after_stats.get('cached_gb', 0):.2f}GB"
-            )
-
-        self.last_cleanup = current_time
-
-    def track_request(self, request_id: str):
-        """Track request access time"""
-        self.request_timestamps[request_id] = time.time()
-
-
-# ============================================================================
-# Batch Processor
-# ============================================================================
-
-class BatchProcessor:
-    """Process inference requests in batches"""
-
-    def __init__(self, server_cfg: ServerConfig, executor: ThreadPoolExecutor):
-        self.enabled = server_cfg.batching.enabled
-        self.max_batch_size = server_cfg.batching.max_batch_size
-        self.batch_timeout = server_cfg.batching.batch_timeout_ms / 1000.0
-
-        self.executor = executor
-        self.queue = asyncio.Queue(maxsize=server_cfg.limits.max_queue_size)
-        self.running = False
-
-        logger.info(
-            f"BatchProcessor initialized: enabled={self.enabled}, "
-            f"max_batch_size={self.max_batch_size}, timeout={self.batch_timeout}s"
-        )
-
-    async def add_request(self, request: InferenceRequest) -> Any:
-        """Add request to queue and wait for result"""
-        try:
-            await asyncio.wait_for(
-                self.queue.put(request),
-                timeout=5.0
-            )
-
-            # Wait for result
-            timeout = config.server.limits.request_timeout
-            result = await asyncio.wait_for(request.future, timeout=timeout)
-            return result
-
-        except asyncio.TimeoutError:
-            logger.error(f"Request {request.request_id} timed out")
-            raise HTTPException(status_code=504, detail="Request timeout")
-        except asyncio.QueueFull:
-            logger.error(f"Request queue full, rejecting request {request.request_id}")
-            raise HTTPException(status_code=503, detail="Server overloaded")
-
-    async def process_loop(self):
-        """Main processing loop"""
-        self.running = True
-        logger.info("Batch processing loop started")
-
-        while self.running:
-            try:
-                batch = await self._collect_batch()
-
-                if not batch:
-                    await asyncio.sleep(0.01)
-                    continue
-
-                # Process batch in thread pool
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    self.executor,
-                    self._process_batch,
-                    batch
-                )
-
-            except Exception as e:
-                logger.error(f"Error in batch processing loop: {e}", exc_info=True)
-                await asyncio.sleep(0.1)
-
-    async def _collect_batch(self) -> List[InferenceRequest]:
-        """Collect requests into a batch"""
-        batch = []
-        deadline = time.time() + self.batch_timeout
-
-        # Get first request (blocking with timeout)
-        try:
-            first_request = await asyncio.wait_for(
-                self.queue.get(),
-                timeout=self.batch_timeout
-            )
-            batch.append(first_request)
-        except asyncio.TimeoutError:
-            return batch
-
-        # Collect additional requests until batch full or timeout
-        while len(batch) < self.max_batch_size and time.time() < deadline:
-            try:
-                request = await asyncio.wait_for(
-                    self.queue.get(),
-                    timeout=max(0.001, deadline - time.time())
-                )
-                batch.append(request)
-            except asyncio.TimeoutError:
-                break
-
-        return batch
-
-    def _process_batch(self, batch: List[InferenceRequest]):
-        """Process a batch of requests (runs in thread pool)"""
-        try:
-            logger.debug(f"Processing batch of {len(batch)} requests")
-
-            # Separate streaming and non-streaming requests
-            stream_requests = [r for r in batch if r.stream]
-            non_stream_requests = [r for r in batch if not r.stream]
-
-            # Process non-streaming in batch
-            if non_stream_requests:
-                self._process_non_stream_batch(non_stream_requests)
-
-            # Process streaming individually (batching streaming is complex)
-            for request in stream_requests:
-                self._process_stream_request(request)
-
-        except Exception as e:
-            logger.error(f"Error processing batch: {e}", exc_info=True)
-            for request in batch:
-                if not request.future.done():
-                    request.future.set_exception(e)
-
-    def _process_non_stream_batch(self, batch: List[InferenceRequest]):
-        """Process non-streaming requests in batch"""
-        if len(batch) == 1:
-            # Single request - process directly
-            request = batch[0]
-            try:
-                result = self._generate_single(request)
-                request.future.set_result(result)
-            except Exception as e:
-                request.future.set_exception(e)
-            return
-
-        # Batch processing
-        try:
-            # Prepare batch inputs
-            prompts = []
-            for req in batch:
-                prompt = tokenizer.apply_chat_template(
-                    req.messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    tools=req.tools or None,
-                    open_thinking=req.open_thinking
-                )
-                prompts.append(prompt)
-
-            # Tokenize batch
-            inputs = tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True
-            ).to(model.device)
-
-            # Generate
-            gen_params = batch[0].gen_params  # Use first request's params
-            max_tokens = gen_params.get('max_tokens', 8192)
-
-            with torch.no_grad():
-                outputs = model.generate(
-                    input_ids=inputs.input_ids,
-                    attention_mask=inputs.attention_mask,
-                    max_new_tokens=max_tokens,
-                    do_sample=gen_params.get('do_sample', True),
-                    temperature=gen_params.get('temperature', 0.7),
-                    top_p=gen_params.get('top_p', 0.92),
-                    top_k=gen_params.get('top_k', 50),
-                    repetition_penalty=gen_params.get('repetition_penalty', 1.0),
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-
-            # Decode outputs
-            for i, request in enumerate(batch):
-                try:
-                    output_ids = outputs[i][inputs.input_ids[i].shape[0]:]
-                    generated_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-
-                    content, reasoning_content, tool_calls = parse_response(generated_text)
-
-                    result = {
-                        "content": content,
-                        "reasoning_content": reasoning_content,
-                        "tool_calls": tool_calls
-                    }
-
-                    request.future.set_result(result)
-                    memory_monitor.track_request(request.request_id)
-
-                except Exception as e:
-                    logger.error(f"Error processing request {request.request_id}: {e}")
-                    request.future.set_exception(e)
-
-        except Exception as e:
-            logger.error(f"Error in batch generation: {e}", exc_info=True)
-            for request in batch:
-                if not request.future.done():
-                    request.future.set_exception(e)
-
-    def _process_stream_request(self, request: InferenceRequest):
-        """Process streaming request individually"""
-        try:
-            # For streaming, return a generator
-            generator = self._generate_stream(request)
-            request.future.set_result(generator)
-        except Exception as e:
-            request.future.set_exception(e)
-
-    def _generate_single(self, request: InferenceRequest) -> Dict[str, Any]:
-        """Generate response for single request"""
-        prompt = tokenizer.apply_chat_template(
-            request.messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            tools=request.tools or None,
-            open_thinking=request.open_thinking
-        )
-
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        max_tokens = request.gen_params.get('max_tokens', 8192)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                max_new_tokens=max_tokens,
-                do_sample=request.gen_params.get('do_sample', True),
-                temperature=request.gen_params.get('temperature', 0.7),
-                top_p=request.gen_params.get('top_p', 0.92),
-                top_k=request.gen_params.get('top_k', 50),
-                repetition_penalty=request.gen_params.get('repetition_penalty', 1.0),
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        output_ids = outputs[0][inputs.input_ids.shape[1]:]
-        generated_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-
-        content, reasoning_content, tool_calls = parse_response(generated_text)
-
-        memory_monitor.track_request(request.request_id)
-
-        return {
-            "content": content,
-            "reasoning_content": reasoning_content,
-            "tool_calls": tool_calls
-        }
-
-    def _generate_stream(self, request: InferenceRequest):
-        """Generate streaming response (generator function)"""
-        prompt = tokenizer.apply_chat_template(
-            request.messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            tools=request.tools or None,
-            open_thinking=request.open_thinking
-        )
-
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        max_tokens = request.gen_params.get('max_tokens', 8192)
-
-        # Use model.generate with streamer
-        from transformers import TextIteratorStreamer
-        from threading import Thread
-
-        streamer = TextIteratorStreamer(
-            tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=True
-        )
-
-        generation_kwargs = {
-            'input_ids': inputs.input_ids,
-            'attention_mask': inputs.attention_mask,
-            'max_new_tokens': max_tokens,
-            'do_sample': request.gen_params.get('do_sample', True),
-            'temperature': request.gen_params.get('temperature', 0.7),
-            'top_p': request.gen_params.get('top_p', 0.92),
-            'top_k': request.gen_params.get('top_k', 50),
-            'repetition_penalty': request.gen_params.get('repetition_penalty', 1.0),
-            'pad_token_id': tokenizer.pad_token_id,
-            'eos_token_id': tokenizer.eos_token_id,
-            'streamer': streamer,
-        }
-
-        # Shared exception holder for propagating fatal errors from generation thread
-        gen_error: Dict[str, Any] = {"exc": None}
-
-        def _safe_generate():
-            """Run model.generate with error capture and guaranteed streamer cleanup."""
-            try:
-                model.generate(**generation_kwargs)
-            except Exception as e:
-                gen_error["exc"] = e
-                logger.error(f"Generation thread error: {e}", exc_info=True)
-            finally:
-                # Always signal streamer end so the consumer iterator does not
-                # block forever on queue.get() when generation fails mid-stream.
-                try:
-                    streamer.end()
-                except Exception:
-                    pass
-
-        # daemon=True so the process can exit on Ctrl+C even if generation is stuck
-        thread = Thread(target=_safe_generate, daemon=True)
-        thread.start()
-
-        # Yield tokens; propagate any fatal error (e.g. CUDA OOM) after stream ends
-        full_text = ""
-        try:
-            for text in streamer:
-                full_text += text
-                yield text
-        finally:
-            thread.join(timeout=10.0)
-            memory_monitor.track_request(request.request_id)
-            if gen_error["exc"] is not None:
-                raise gen_error["exc"]
-
-    async def stop(self):
-        """Stop processing loop"""
-        self.running = False
-        logger.info("Batch processor stopped")
-
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
-
-
-def generate_tool_call_id() -> str:
-    return f"call_{uuid.uuid4().hex[:24]}"
-
-
-def parse_response(text: str):
-    """Parse model response to extract reasoning content and tool calls"""
-    # 提取所有 thinking 块（支持多个，合并为一个 reasoning_content）
-    THINK_PATTERN = re.compile(
-        r'<(thinking|think)>(.*?)</(thinking|think)>',
-        re.DOTALL
-    )
-    reasoning_parts = []
-
-    def _collect_thinking(m: re.Match) -> str:
-        reasoning_parts.append(m.group(2).strip())
-        return ''  # 替换为空字符串，从 text 中移除
-
-    text = THINK_PATTERN.sub(_collect_thinking, text)
-    reasoning_content = '\n'.join(reasoning_parts) if reasoning_parts else None
-
-    tool_calls = []
-    for i, m in enumerate(re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL)):
-        try:
-            call = json.loads(m.strip())
-            tool_calls.append({
-                "id": generate_tool_call_id(),
-                "type": "function",
-                "function": {
-                    "name": call.get("name", ""),
-                    "arguments": json.dumps(call.get("arguments", {}), ensure_ascii=False)
-                }
-            })
-        except Exception as e:
-            logger.warning(f"Failed to parse tool call: {e}")
-
-    if tool_calls:
-        text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
-
-    return text.strip(), reasoning_content, tool_calls or None
-
-
-def configure_cuda_precision(device_config: DeviceConfig) -> None:
-    """Configure TF32 and float32 matmul precision when CUDA is available."""
-
-    if device_config.device not in {None, "auto", "cuda"} or not torch.cuda.is_available():
-        return
-
-    torch.backends.cudnn.allow_tf32 = device_config.tf32
-    torch.set_float32_matmul_precision("high" if device_config.tf32 else "highest")
-
-
-def init_model(
-    model_cfg: ModelConfig,
-    device_cfg: DeviceConfig,
-):
-    """Initialize model and tokenizer — corrected initialization order"""
-    global model, tokenizer
-
-    logger.info(f"Loading model from {model_cfg.name_or_path}")
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 1: Build tokenizer kwargs（过滤掉 post-load 设置的字段）
-    # ════════════════════════════════════════════════════════════════
-    POST_LOAD_FIELDS = {"chat_template", "eos_token", "pad_token"}
-    tokenizer_config = model_cfg.tokenizer
-    tokenizer_kwargs = {
-        k: v
-        for k, v in asdict(tokenizer_config).items()
-        if k not in POST_LOAD_FIELDS and v is not None
-    }
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 2: 加载 tokenizer
-    # ════════════════════════════════════════════════════════════════
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_cfg.name_or_path,
-        trust_remote_code=model_cfg.trust_remote_code,
-        **tokenizer_kwargs,
-    )
-
-    # Step 3: Post-load tokenizer 属性设置
-    if tokenizer_config.chat_template:
-        tokenizer.chat_template = tokenizer_config.chat_template
-    if tokenizer_config.eos_token:
-        tokenizer.eos_token = tokenizer_config.eos_token
-    if tokenizer_config.pad_token:
-        tokenizer.pad_token = tokenizer_config.pad_token
-    elif tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    logger.info(f"Tokenizer loaded. vocab_size={len(tokenizer)}")
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 4: 构建 model_kwargs
-    # ════════════════════════════════════════════════════════════════
-    model_kwargs = dict(model_cfg.model_kwargs)
-    model_kwargs["trust_remote_code"] = model_cfg.trust_remote_code
-    model_kwargs["revision"] = model_cfg.model_revision
-
-    # dtype
-    torch_dtype_str = device_cfg.dtype or model_cfg.torch_dtype
-    if torch_dtype_str and torch_dtype_str != "auto":
-        model_kwargs["torch_dtype"] = getattr(torch, torch_dtype_str)
-    else:
-        model_kwargs["torch_dtype"] = "auto"
-
-    # attention implementation
-    if model_cfg.attn_implementation:
-        model_kwargs["attn_implementation"] = model_cfg.attn_implementation
-
-    # KV cache
-    if model_cfg.use_cache is not None:
-        model_kwargs["use_cache"] = model_cfg.use_cache
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 5: device_map / GPU 配置（量化时必须用 device_map）
-    # ════════════════════════════════════════════════════════════════
-    quant_cfg = model_cfg.quantization
-    is_quantized = quant_cfg.enabled
-
-    if device_cfg.gpus and not device_cfg.device_map:
-        gpu_ids = ",".join(map(str, device_cfg.gpus))
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
-        model_kwargs["device_map"] = "auto"
-        logger.info(f"Multi-GPU: CUDA_VISIBLE_DEVICES={gpu_ids}")
-    elif device_cfg.device_map:
-        model_kwargs["device_map"] = device_cfg.device_map
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 6: 量化配置（必须在 from_pretrained 之前确定）
-    # ════════════════════════════════════════════════════════════════
-    if is_quantized:
-        if not model_kwargs.get("device_map"):
-            # BitsAndBytes 量化必须配合 device_map
-            model_kwargs["device_map"] = "auto"
-            logger.warning("Quantization requires device_map, auto-setting to 'auto'")
-
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_8bit=quant_cfg.load_in_8bit,
-            llm_int8_threshold=quant_cfg.llm_int8_threshold,
-            llm_int8_skip_modules=quant_cfg.llm_int8_skip_modules,
-            llm_int8_enable_fp32_cpu_offload=quant_cfg.llm_int8_enable_fp32_cpu_offload,
-            llm_int8_has_fp16_weight=quant_cfg.llm_int8_has_fp16_weight,
-            load_in_4bit=quant_cfg.load_in_4bit,
-            bnb_4bit_compute_dtype=getattr(torch, quant_cfg.bnb_4bit_compute_dtype),
-            bnb_4bit_use_double_quant=quant_cfg.bnb_4bit_use_double_quant,
-            bnb_4bit_quant_type=quant_cfg.bnb_4bit_quant_type,
-        )
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 7: 加载模型
-    # ════════════════════════════════════════════════════════════════
-    logger.info(f"Loading model with kwargs: { {k: v for k, v in model_kwargs.items() if k != 'quantization_config'} }")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_cfg.name_or_path,
-        **model_kwargs,
-    )
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 8: 手动 .to(device)（仅在没有 device_map 且未量化时）
-    # ════════════════════════════════════════════════════════════════
-    uses_device_map = bool(model_kwargs.get("device_map"))
-    if not uses_device_map and not is_quantized:
-        if torch.cuda.is_available():
-            target_device = device_cfg.device or "cuda"
-        else:
-            target_device = "cpu"
-            if device_cfg.device and device_cfg.device != "cpu":
-                logger.warning(f"CUDA not available, falling back to CPU (requested: {device_cfg.device})")
-        model = model.to(target_device)
-        logger.info(f"Model moved to device: {target_device}")
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 9: eval 模式（必须在 compile 之前）
-    # ════════════════════════════════════════════════════════════════
-    model.eval()
-
-    # ════════════════════════════════════════════════════════════════
-    # Step 10: Liger Kernel（必须在 compile 之前，from_pretrained 之后）
-    # ════════════════════════════════════════════════════════════════
-    if model_cfg.apply_liger_kernel:
-        try:
-            from transformers.integrations.liger import apply_liger_kernel
-            apply_liger_kernel(model, model_cfg.kernel_config)
-            logger.info("Applied Liger Kernel optimizations")
-        except ImportError:
-            logger.warning("liger_kernel not installed, skipping optimization")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model loaded successfully. Total parameters: {total_params / 1e6:.2f}M")
-
-    return model, tokenizer
-
-
-# ============================================================================
-# Background Tasks
-# ============================================================================
-
-async def memory_cleanup_task():
-    """Background task for periodic memory cleanup"""
-    logger.info("Memory cleanup task started")
-
-    while True:
-        try:
-            await asyncio.sleep(memory_monitor.cleanup_interval)
-            memory_monitor.cleanup_cache()
-
-            stats = memory_monitor.get_memory_stats()
-            if stats:
-                logger.debug(f"Memory stats: {stats}")
-
-        except Exception as e:
-            logger.error(f"Error in memory cleanup task: {e}", exc_info=True)
-
-
-# ============================================================================
-# FastAPI Application
-# ============================================================================
-
-def normalize_messages_for_template(messages: List[dict]) -> List[dict]:
-    """
-    将 Pydantic model_dump 产出的 messages 规范化，
-    确保 tool_calls[].function.arguments 始终为 str（JSON 字符串），
-    同时兼容部分模型 chat_template 期望 dict 的情况由 tokenizer 自行处理。
-    此函数统一输出 str，与 OpenAI 规范一致。
-    """
-    normalized = []
-    for msg in messages:
-        msg = dict(msg)  # shallow copy，避免修改原始数据
-        if msg.get("tool_calls"):
-            new_tool_calls = []
-            for tc in msg["tool_calls"]:
-                tc = dict(tc)
-                func = dict(tc.get("function", {}))
-                args = func.get("arguments", {})
-                if isinstance(args, dict):
-                    # dict -> JSON str
-                    func["arguments"] = json.dumps(args, ensure_ascii=False)
-                elif isinstance(args, str):
-                    # 已经是 str，验证是否合法 JSON
-                    try:
-                        json.loads(args)
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            f"tool_call arguments is invalid JSON str: {args[:100]}, "
-                            f"wrapping as empty object"
-                        )
-                        func["arguments"] = "{}"
-                else:
-                    func["arguments"] = json.dumps(args, ensure_ascii=False)
-                tc["function"] = func
-                new_tool_calls.append(tc)
-            msg["tool_calls"] = new_tool_calls
-        normalized.append(msg)
-    return normalized
-
+from .api.middleware import MemoryCheckMiddleware
+from .api.models import ChatRequest
+from .configs import load_config
+from .inference import InferenceEngine, RequestQueue, StreamHandler
+from .inference.types import InferenceRequest
+from .utils import MemoryMonitor, setup_logging
+
+logger = logging.getLogger(__name__)
+
+# ── 全局单例（仅 server.py 持有） ──────────────────────────────────────
+_engine: InferenceEngine | None = None
+_queue: RequestQueue | None = None
+_monitor: MemoryMonitor | None = None
+_config = None
+
+
+# ── Lifespan ────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager for FastAPI app"""
-    global inference_executor, batch_processor, memory_monitor
+    global _queue, _monitor
 
-    # Startup
-    logger.info("Starting up server...")
+    logger.info("Server starting up...")
 
-    # Initialize thread pool for model inference
-    inference_executor = ThreadPoolExecutor(max_workers=1)  # Single worker for thread safety
+    _monitor = MemoryMonitor(_config.memory)
+    _queue = RequestQueue(_engine, _config.server)
+    _queue.start()
 
-    # Initialize memory monitor
-    memory_monitor = MemoryMonitor(config.memory)
+    # 注册中间件（需在第一个请求前完成）
+    app.add_middleware(MemoryCheckMiddleware, monitor=_monitor)
 
-    # Initialize batch processor
-    batch_processor = BatchProcessor(config.server, inference_executor)
+    cleanup_task = __import__("asyncio").ensure_future(_monitor.run_cleanup_loop())
 
-    # Start background tasks
-    batch_task = asyncio.create_task(batch_processor.process_loop())
-    cleanup_task = asyncio.create_task(memory_cleanup_task())
-
-    logger.info("Server startup complete")
-
+    logger.info("Server ready.")
     yield
 
-    # Shutdown
-    logger.info("Shutting down server...")
-
-    await batch_processor.stop()
-    batch_task.cancel()
+    logger.info("Server shutting down...")
     cleanup_task.cancel()
-
-    inference_executor.shutdown(wait=True)
-
-    logger.info("Server shutdown complete")
+    await _queue.stop()
+    logger.info("Server stopped.")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-@app.middleware("http")
-async def memory_check_middleware(request: Request, call_next):
-    """Check memory before processing request"""
-    if request.url.path.startswith("/v1/chat/completions"):
-        if not memory_monitor.check_memory_available():
-            stats = memory_monitor.get_memory_stats()
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=503,
-                content={"detail": f"GPU memory exhausted: {stats}"}
-            )
-
-    response = await call_next(request)
-    return response
-
+# ── 路由 ────────────────────────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
-    """OpenAI-compatible chat completions endpoint"""
     try:
-        request_id = f"req_{int(time.time() * 1000)}"
-        gen_params = request.get_generation_params()
+        gen_defaults = {
+            "temperature": _config.generation.temperature,
+            "top_p": _config.generation.top_p,
+            "top_k": _config.generation.top_k,
+            "max_tokens": _config.generation.max_tokens or 8192,
+            "repetition_penalty": _config.generation.repetition_penalty,
+            "num_beams": _config.generation.num_beams,
+            "do_sample": _config.generation.do_sample,
+            "no_repeat_ngram_size": _config.generation.no_repeat_ngram_size,
+        }
 
-        # Create inference request
-        inference_request = InferenceRequest(
-            request_id=request_id,
-            messages=normalize_messages_for_template(
-                [msg.model_dump(exclude_none=True) for msg in request.messages]
-            ),
-            gen_params=gen_params,
-            tools=request.tools,
+        inference_req = InferenceRequest(
+            request_id=InferenceRequest.make_id(),
+            messages=request.normalized_messages(),
+            gen_config=request.build_generation_config(gen_defaults),
+            tools=request.tools or None,
             open_thinking=request.get_open_thinking(),
-            stream=request.stream
+            stream=request.stream,
         )
 
-        # Add to batch processor
-        result = await batch_processor.add_request(inference_request)
+        result = await _queue.enqueue(inference_req)
 
-        # Handle streaming response
+        # ── 流式响应 ─────────────────────────────────────────────────
         if request.stream:
-            def emit_tool_call_stream_chunks(raw_buffer: str, tc_index: int):
-                """
-                将完整的 <tool_call>...</tool_call> 字符串按 OpenAI 流式格式拆分。
-                raw_buffer 必须包含且仅包含一个完整 tool_call 块。
-                """
-                m = re.search(r'<tool_call>(.*?)</tool_call>', raw_buffer, re.DOTALL)
-                if not m:
-                    logger.warning(f"emit_tool_call_stream_chunks: no tool_call found in buffer")
-                    return
-                try:
-                    call = json.loads(m.group(1).strip())
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse tool_call JSON in stream: {e}, raw={m.group(1)[:200]}")
-                    return
+            handler = StreamHandler(open_thinking=request.get_open_thinking())
 
-                call_id = generate_tool_call_id()
-                args_str = json.dumps(call.get("arguments", {}), ensure_ascii=False)
-                func_name = call.get("name", "")
+            async def event_stream():
+                async for chunk in handler.run(result):
+                    yield chunk
 
-                # Chunk 1: id + name + 空 arguments
-                yield (
-                    f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': tc_index, 'id': call_id, 'type': 'function', 'function': {'name': func_name, 'arguments': ''}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-                )
-                # Chunk 2~N: arguments 分块
-                chunk_size = 16
-                for start in range(0, len(args_str), chunk_size):
-                    chunk = args_str[start: start + chunk_size]
-                    yield (
-                        f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': tc_index, 'function': {'arguments': chunk}}]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-                    )
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-            async def stream_generator():
-                """Async generator for streaming response"""
-                full_text = ""
-                open_thinking = request.get_open_thinking()
-                phase = "thinking" if open_thinking else "content"
+        # ── 非流式响应 ───────────────────────────────────────────────
+        message: dict = {"role": "assistant", "content": result.content}
+        if result.reasoning_content:
+            message["reasoning_content"] = result.reasoning_content
+        if result.tool_calls:
+            message["tool_calls"] = result.tool_calls
 
-                # content_sent_len: full_text[:content_sent_len] 已发送给客户端
-                content_sent_len = 0
-                # thinking_start: <thinking>/<think> 起始位置（含标签）
-                thinking_start = 0
-                # tool_call_search_start: 在 full_text 中搜索下一个 <tool_call> 的起始位置
-                tool_call_search_start = 0
-                tool_call_index = 0
-
-                # ── TOOL_CALL_OPEN_TAG 长度常量，用于防止把未完整到达的标签当 content 发出 ──
-                TC_OPEN = '<tool_call>'
-                TC_OPEN_LEN = len(TC_OPEN)
-
-                gen_error_stream = None
-
-                while True:
-                    try:
-                        # asyncio.to_thread prevents blocking the event loop while
-                        # waiting for the next token; this keeps Ctrl+C responsive
-                        # and allows the async generator to be cancelled by Starlette
-                        # on client disconnect.
-                        token = await asyncio.to_thread(next, result, None)
-                    except Exception as e:
-                        # Fatal error from the generation thread (e.g. CUDA OOM)
-                        # propagated through the sync generator's finally-raise.
-                        gen_error_stream = e
-                        break
-                    if token is None:
-                        break
-                    full_text += token
-
-                    # ════════════════════════════════════════════════════════
-                    # Phase: thinking
-                    #   等待 </thinking> 或 </think>，期间不向客户端发送任何内容
-                    # ════════════════════════════════════════════════════════
-                    if phase == "thinking":
-                        end_tag = None
-                        if '</thinking>' in full_text:
-                            end_tag = '</thinking>'
-                        elif '</think>' in full_text:
-                            end_tag = '</think>'
-
-                        if end_tag is not None:
-                            end_pos = full_text.index(end_tag)
-                            # 去掉开始标签，提取纯推理文本
-                            raw_thinking = full_text[thinking_start: end_pos]
-                            reasoning = re.sub(r'</?think(?:ing)?>', '', raw_thinking).strip()
-                            if reasoning:
-                                yield (
-                                    f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': reasoning}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-                                )
-                            # content 从 end_tag 之后开始
-                            content_sent_len = end_pos + len(end_tag)
-                            tool_call_search_start = content_sent_len
-                            phase = "content"
-                            # ✅ 不 continue：让本次循环继续走 content 分支
-                            #    处理 after 部分（end_tag 之后已到达的字符）
-                        else:
-                            continue  # 还在 thinking 中，继续等待
-
-                    # ════════════════════════════════════════════════════════
-                    # Phase: content
-                    #   安全地发送 content，同时监听 <tool_call> 起始
-                    # ════════════════════════════════════════════════════════
-                    if phase == "content":
-                        # 在未发送区域内搜索 <tool_call>
-                        tc_pos = full_text.find(TC_OPEN, tool_call_search_start)
-
-                        if tc_pos == -1:
-                            # 没有 <tool_call>
-                            # 保留末尾 TC_OPEN_LEN-1 字节作为"不安全缓冲"
-                            # 防止 <tool_call> 被 token 边界切断后前半部分误发
-                            safe_end = max(content_sent_len, len(full_text) - (TC_OPEN_LEN - 1))
-                            if safe_end > content_sent_len:
-                                to_send = full_text[content_sent_len: safe_end]
-                                yield (
-                                    f"data: {json.dumps({'choices': [{'delta': {'content': to_send}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-                                )
-                                content_sent_len = safe_end
-                            # tool_call_search_start 推进到 safe_end，避免重复搜索已确认无 TC_OPEN 的区域
-                            tool_call_search_start = content_sent_len
-                            continue
-
-                        # 找到 <tool_call>
-                        # 先发送 tc_pos 之前未发送的 content
-                        if tc_pos > content_sent_len:
-                            to_send = full_text[content_sent_len: tc_pos]
-                            yield (
-                                f"data: {json.dumps({'choices': [{'delta': {'content': to_send}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-                            )
-                        content_sent_len = tc_pos  # 位置停在 <tool_call> 起始
-                        tool_call_search_start = tc_pos
-                        phase = "tool_call"
-                        # ✅ 不 continue：让本次循环继续走 tool_call 分支
-                        #    处理当前 token 带来的 tool_call 内容
-
-                    # ════════════════════════════════════════════════════════
-                    # Phase: tool_call
-                    #   从 full_text[tool_call_search_start:] 切片，不独立维护 buf
-                    #   等待 </tool_call> 到达后一次性处理
-                    # ════════════════════════════════════════════════════════
-                    if phase == "tool_call":
-                        # 从 full_text 切片，永远不重复追加
-                        tc_slice = full_text[tool_call_search_start:]
-
-                        if '</tool_call>' not in tc_slice:
-                            continue  # tool_call 尚未结束，继续等待
-
-                        # 提取完整的单个 tool_call 块
-                        tc_end_tag = '</tool_call>'
-                        tc_end_pos = tc_slice.index(tc_end_tag) + len(tc_end_tag)
-                        single_tc_raw = tc_slice[:tc_end_pos]
-
-                        # 发送流式 chunks
-                        for chunk in emit_tool_call_stream_chunks(single_tc_raw, tool_call_index):
-                            yield chunk
-                        tool_call_index += 1
-
-                        # 推进 content_sent_len 和 search_start 到该 tool_call 结束位置
-                        abs_tc_end = tool_call_search_start + tc_end_pos
-                        content_sent_len = abs_tc_end
-                        tool_call_search_start = abs_tc_end
-
-                        # 检查紧跟其后是否还有 <tool_call>
-                        after_tc = full_text[abs_tc_end:]
-                        if TC_OPEN in after_tc:
-                            # 定位到下一个 tool_call，保持 phase = "tool_call"
-                            next_tc_rel = after_tc.index(TC_OPEN)
-                            tool_call_search_start = abs_tc_end + next_tc_rel
-                        else:
-                            # 没有更多 tool_call，退回 content phase
-                            phase = "content"
-                            tool_call_search_start = abs_tc_end
-                        continue
-
-                # ── 生成过程中出现致命错误（如 CUDA OOM），通知客户端 ──────────
-                if gen_error_stream is not None:
-                    logger.error(
-                        f"Streaming generation error: {gen_error_stream}",
-                        exc_info=True,
-                    )
-                    yield (
-                        f"data: {json.dumps({'error': {'message': str(gen_error_stream), 'type': 'internal_error'}}, ensure_ascii=False)}\n\n"
-                    )
-                    yield (
-                        f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'error'}]}, ensure_ascii=False)}\n\n"
-                    )
-                    yield "data: [DONE]\n\n"
-                    return
-
-                # ── 流结束后：冲刷剩余 content ────────────────────────────────
-                if phase == "content" and content_sent_len < len(full_text):
-                    remaining = full_text[content_sent_len:]
-                    if remaining.strip():
-                        yield (
-                            f"data: {json.dumps({'choices': [{'delta': {'content': remaining}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
-                        )
-
-                has_tool_calls = tool_call_index > 0
-                finish_reason = "tool_calls" if has_tool_calls else "stop"
-                yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': finish_reason}]}, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                stream_generator(),
-                media_type="text/event-stream"
-            )
-
-        # Non-streaming response
-        else:
-            message = {"role": "assistant", "content": result["content"]}
-            if result["reasoning_content"]:
-                message["reasoning_content"] = result["reasoning_content"]
-            if result["tool_calls"]:
-                message["tool_calls"] = result["tool_calls"]
-
-            return {
-                "id": f"chatcmpl-{int(time.time())}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": request.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": message,
-                        "finish_reason": "tool_calls" if result["tool_calls"] else "stop"
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
-                }
-            }
+        return {
+            "id": f"chatcmpl-{inference_req.request_id}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": "tool_calls" if result.tool_calls else "stop",
+            }],
+            "usage": _compute_usage(inference_req, result),
+        }
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error in chat_completions: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error("Unhandled error in chat_completions: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/v1/models")
 def list_models():
-    """List available models"""
     return {
         "object": "list",
-        "data": [
-            {
-                "id": config.model.name,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": config.title,
-            }
-        ]
+        "data": [{
+            "id": _config.model.name,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": _config.title,
+        }],
     }
 
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint"""
-    stats = memory_monitor.get_memory_stats() if memory_monitor else {}
-
     return {
         "status": "healthy",
-        "model_loaded": model is not None,
-        "memory": stats,
-        "queue_size": batch_processor.queue.qsize() if batch_processor else 0
+        "model_loaded": _engine is not None and _engine._loaded,
+        "memory": _monitor.get_stats() if _monitor else {},
+        "queue_size": _queue.queue_size if _queue else 0,
     }
 
 
 @app.get("/metrics")
 def metrics():
-    """Prometheus-style metrics endpoint"""
-    stats = memory_monitor.get_memory_stats() if memory_monitor else {}
-
-    metrics_text = f"""# HELP gpu_memory_allocated_gb GPU memory allocated in GB
-# TYPE gpu_memory_allocated_gb gauge
-gpu_memory_allocated_gb {stats.get('allocated_gb', 0)}
-
-# HELP gpu_memory_total_gb Total GPU memory in GB
-# TYPE gpu_memory_total_gb gauge
-gpu_memory_total_gb {stats.get('total_gb', 0)}
-
-# HELP gpu_memory_ratio GPU memory utilization ratio
-# TYPE gpu_memory_ratio gauge
-gpu_memory_ratio {stats.get('ratio', 0)}
-
-# HELP request_queue_size Current request queue size
-# TYPE request_queue_size gauge
-request_queue_size {batch_processor.queue.qsize() if batch_processor else 0}
-"""
-
-    return metrics_text
-
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="LLMs API Server - Production Ready"
+    stats = _monitor.get_stats() if _monitor else {}
+    queue_size = _queue.queue_size if _queue else 0
+    return (
+        f"# HELP gpu_memory_allocated_gb GPU memory allocated\n"
+        f"# TYPE gpu_memory_allocated_gb gauge\n"
+        f"gpu_memory_allocated_gb {stats.get('allocated_gb', 0)}\n\n"
+        f"# HELP gpu_memory_total_gb Total GPU memory\n"
+        f"# TYPE gpu_memory_total_gb gauge\n"
+        f"gpu_memory_total_gb {stats.get('total_gb', 0)}\n\n"
+        f"# HELP gpu_memory_ratio GPU memory utilization\n"
+        f"# TYPE gpu_memory_ratio gauge\n"
+        f"gpu_memory_ratio {stats.get('ratio', 0)}\n\n"
+        f"# HELP request_queue_size Current queue depth\n"
+        f"# TYPE request_queue_size gauge\n"
+        f"request_queue_size {queue_size}\n"
     )
 
-    parser.add_argument('--config', default='config/production.yaml', type=str, help="Path to YAML configuration file")
-    parser.add_argument('--device', type=str, help="Override device")
-    parser.add_argument('--dtype', type=str, help="Override dtype")
-    parser.add_argument('--gpus', type=str, help="Comma-separated GPU IDs")
-    parser.add_argument('--host', type=str, help="Override server host")
-    parser.add_argument('--port', type=int, help="Override server port")
-    parser.add_argument('--log-level', type=str, help="Override log level")
 
+# ── 工具函数 ─────────────────────────────────────────────────────────────
+
+def _compute_usage(req: InferenceRequest, result) -> dict:
+    """计算实际 token 用量（需要 tokenizer 可访问）。"""
+    try:
+        tok = _engine.tokenizer
+        prompt_text = tok.apply_chat_template(
+            req.messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_tokens = len(tok.encode(prompt_text))
+        completion_tokens = len(tok.encode(result.content or ""))
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    except Exception as exc:
+        logger.warning("Failed to compute token usage: %s", exc)
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+# ── 主入口 ───────────────────────────────────────────────────────────────
+
+def main():
+    global _engine, _config
+
+    parser = argparse.ArgumentParser(description="LLMs API Server")
+    parser.add_argument("--config", default="config/production.yaml")
+    parser.add_argument("--device", type=str)
+    parser.add_argument("--dtype", type=str)
+    parser.add_argument("--gpus", type=str)
+    parser.add_argument("--host", type=str)
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--log-level", type=str)
     args = parser.parse_args()
 
-    # Load config
-    config = load_config(args.config)
+    _config = load_config(args.config)
 
-    # Setup logging
-    log_level = args.log_level or config.server.log_level
-    setup_logging(config.title, log_level)
+    log_level = args.log_level or _config.server.log_level
+    setup_logging(_config.title, log_level)
 
-    # Override config with CLI args
     if args.device:
-        config.device.device = args.device
+        _config.device.device = args.device
     if args.dtype:
-        config.device.dtype = args.dtype
+        _config.device.dtype = args.dtype
     if args.gpus:
-        config.device.gpus = [int(g) for g in args.gpus.split(',')]
+        _config.device.gpus = [int(g) for g in args.gpus.split(",")]
 
-    host = args.host or config.server.host
-    port = args.port or config.server.port
+    host = args.host or _config.server.host
+    port = args.port or _config.server.port
 
-    # Initialize model
     logger.info("Initializing model...")
-    configure_cuda_precision(config.device)
-    model, tokenizer = init_model(config.model, config.device)
+    _engine = InferenceEngine()
+    _engine.load(_config.model, _config.device)
 
-    # Start server
-    uvicorn_config = {
-        'app': app,
-        'host': host,
-        'port': port,
-        'log_level': config.server.log_level.lower(),
-        'timeout_keep_alive': config.server.timeout_keep_alive,
-    }
+    logger.info("Starting server on %s:%d", host, port)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=_config.server.log_level.lower(),
+        timeout_keep_alive=_config.server.timeout_keep_alive,
+    )
 
-    logger.info(f"Starting server on {host}:{port}")
-    uvicorn.run(**uvicorn_config)
+
+if __name__ == "__main__":
+    main()
