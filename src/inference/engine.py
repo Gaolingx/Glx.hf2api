@@ -134,6 +134,20 @@ class InferenceEngine:
 
         return model
 
+    def count_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Any]] = None,
+        open_thinking: bool = False,
+    ) -> int:
+        """
+        计算 apply_chat_template 后的 prompt token 数量。
+        在工作线程或事件循环中均可安全调用（只读操作，无 GPU 计算）。
+        """
+        prompt = self._apply_chat_template(messages, tools, open_thinking)
+        # encode 不构建张量，开销极低
+        return len(self.tokenizer.encode(prompt))
+
     # ------------------------------------------------------------------ #
     # 推理：非流式                                                          #
     # ------------------------------------------------------------------ #

@@ -99,6 +99,7 @@ class LimitsConfig:
     """Server request limits"""
     max_queue_size: int = 100
     request_timeout: int = 300
+    max_input_tokens: int = 0
 
 
 @dataclass

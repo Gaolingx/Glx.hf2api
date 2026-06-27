@@ -11,6 +11,7 @@ import sys
 import time
 
 import uvicorn
+from typing import Any, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -27,7 +28,7 @@ from .utils import MemoryMonitor, setup_logging
 
 logger = logging.getLogger(__name__)
 
-# ── 全局单例（仅 server.py 持有） ───────────────────────────────────────
+# ── 全局单例 ─────────────────────────────────────────────────────────────
 _engine: InferenceEngine | None = None
 _queue: RequestQueue | None = None
 _monitor: MemoryMonitor | None = None
@@ -58,12 +59,9 @@ async def lifespan(app: FastAPI):
     logger.info("Server stopped.")
 
 
-# ── App 创建：中间件在此处注册，通过 lambda 延迟访问 _monitor ─────────────
+# ── App（中间件在模块加载时注册，通过 getter 延迟访问 _monitor）───────────
 
 app = FastAPI(lifespan=lifespan)
-
-# lambda 捕获模块级变量名，每次调用时才读取 _monitor 的当前值
-# lifespan 启动后 _monitor 被赋值，中间件即可正常使用
 app.add_middleware(MemoryCheckMiddleware, monitor_getter=lambda: _monitor)
 
 
@@ -72,6 +70,16 @@ app.add_middleware(MemoryCheckMiddleware, monitor_getter=lambda: _monitor)
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
     try:
+        messages = request.normalized_messages()
+
+        # ── 输入 token 长度校验 ────────────────────────────────────────
+        _check_input_token_limit(
+            messages=messages,
+            tools=request.tools or None,
+            open_thinking=request.get_open_thinking(),
+        )
+
+        # ── 构建推理请求 ───────────────────────────────────────────────
         gen_defaults = {
             "temperature": _config.generation.temperature,
             "top_p": _config.generation.top_p,
@@ -85,7 +93,7 @@ async def chat_completions(request: ChatRequest):
 
         inference_req = InferenceRequest(
             request_id=InferenceRequest.make_id(),
-            messages=request.normalized_messages(),
+            messages=messages,
             gen_config=request.build_generation_config(gen_defaults),
             tools=request.tools or None,
             open_thinking=request.get_open_thinking(),
@@ -151,6 +159,7 @@ def health_check():
         "model_loaded": _engine is not None and _engine._loaded,
         "memory": _monitor.get_stats() if _monitor else {},
         "queue_size": _queue.queue_size if _queue else 0,
+        "max_input_tokens": _config.server.limits.max_input_tokens if _config else 0,
     }
 
 
@@ -175,6 +184,44 @@ def metrics():
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────
+
+def _check_input_token_limit(
+    messages: list,
+    tools: Optional[list],
+    open_thinking: bool,
+) -> None:
+    """
+    校验 prompt token 数是否超出配置上限。
+    超出时抛出 HTTP 413，附带实际 / 上限信息。
+
+    - max_input_tokens <= 0 视为不限制
+    - count_tokens 复用 apply_chat_template，保证计数与推理一致
+    - tokenize 为纯 CPU 操作，在事件循环中同步执行开销可忽略
+    """
+    max_tokens: int = _config.server.limits.max_input_tokens
+    if max_tokens <= 0:
+        return
+
+    actual: int = _engine.count_tokens(messages, tools, open_thinking)
+
+    if actual > max_tokens:
+        logger.warning(
+            "Input token limit exceeded: actual=%d, limit=%d", actual, max_tokens
+        )
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "input_too_long",
+                "message": (
+                    f"Input contains {actual} tokens, "
+                    f"which exceeds the maximum allowed {max_tokens} tokens. "
+                    "Please shorten your messages and try again."
+                ),
+                "input_tokens": actual,
+                "max_input_tokens": max_tokens,
+            },
+        )
+
 
 def _compute_usage(req: InferenceRequest, result) -> dict:
     """计算实际 token 用量。"""
@@ -201,13 +248,14 @@ def main():
     global _engine, _config
 
     parser = argparse.ArgumentParser(description="LLMs API Server")
-    parser.add_argument("--config", default="config/production.yaml")
-    parser.add_argument("--device", type=str)
-    parser.add_argument("--dtype", type=str)
-    parser.add_argument("--gpus", type=str)
-    parser.add_argument("--host", type=str)
-    parser.add_argument("--port", type=int)
-    parser.add_argument("--log-level", type=str)
+    parser.add_argument('--config', default='config/production.yaml', type=str, help="Path to YAML configuration file")
+    parser.add_argument('--device', type=str, help="Override device")
+    parser.add_argument('--dtype', type=str, help="Override dtype")
+    parser.add_argument('--gpus', type=str, help="Comma-separated GPU IDs")
+    parser.add_argument('--host', type=str, help="Override server host")
+    parser.add_argument('--port', type=int, help="Override server port")
+    parser.add_argument('--log-level', type=str, help="Override log level")
+    parser.add_argument("--max-input-tokens", type=int, help="Override max input tokens limit (0 = unlimited)")
     args = parser.parse_args()
 
     _config = load_config(args.config)
@@ -221,9 +269,16 @@ def main():
         _config.device.dtype = args.dtype
     if args.gpus:
         _config.device.gpus = [int(g) for g in args.gpus.split(",")]
+    if args.max_input_tokens is not None:
+        _config.server.limits.max_input_tokens = args.max_input_tokens
 
     host = args.host or _config.server.host
     port = args.port or _config.server.port
+
+    logger.info(
+        "Input token limit: %s",
+        _config.server.limits.max_input_tokens or "unlimited",
+    )
 
     logger.info("Initializing model...")
     _engine = InferenceEngine()
