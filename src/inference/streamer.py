@@ -11,8 +11,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import AsyncGenerator, Optional
 import asyncio
+import uuid
+from typing import AsyncGenerator, Optional
 
 from ..utils.parser import generate_tool_call_id
 from .types import StreamGenerator
@@ -30,11 +31,27 @@ def _sse(data: dict) -> str:
 
 
 def _delta(content_key: str, content_value) -> str:
-    return _sse({"choices": [{"delta": {content_key: content_value}, "finish_reason": None}]})
+    return _sse({
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": {content_key: content_value},
+            "finish_reason": None,
+        }],
+    })
 
 
 def _finish(reason: str) -> str:
-    return _sse({"choices": [{"delta": {}, "finish_reason": reason}]})
+    return _sse({
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": reason,
+        }],
+    })
 
 
 class StreamHandler:
@@ -192,7 +209,9 @@ class StreamHandler:
 
         # Chunk 1：id + name + 空 arguments
         yield _sse({
+            "object": "chat.completion.chunk",
             "choices": [{
+                "index": 0,
                 "delta": {
                     "tool_calls": [{
                         "index": index,
@@ -209,7 +228,9 @@ class StreamHandler:
         chunk_size = 16
         for start in range(0, len(args_str), chunk_size):
             yield _sse({
+                "object": "chat.completion.chunk",
                 "choices": [{
+                    "index": 0,
                     "delta": {
                         "tool_calls": [{
                             "index": index,
