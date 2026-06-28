@@ -123,10 +123,13 @@ class InferenceEngine:
         model = AutoModelForCausalLM.from_pretrained(model_cfg.name_or_path, **model_kwargs)
 
         # 没有 device_map 且未量化：手动 .to(device)
-        if not model_kwargs.get("device_map") and not quant_cfg.enabled:
+        use_device_map = bool(model_kwargs.get("device_map"))
+        if not use_device_map:
             target = self._resolve_device(device_cfg)
             model = model.to(target)
             logger.info(f"Model moved to {target}")
+        else:
+            logger.info(f"Model loaded with device_map={model_kwargs['device_map']}")
 
         model.eval()
 
@@ -233,7 +236,7 @@ class InferenceEngine:
             yield from streamer
         finally:
             thread.join(timeout=30.0)
-            if not thread.is_alive() is False:
+            if thread.is_alive():
                 logger.warning("Generation thread did not finish within timeout.")
             if error_holder["exc"] is not None:
                 raise error_holder["exc"]
