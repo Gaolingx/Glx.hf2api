@@ -15,6 +15,7 @@ from typing import Any, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 __package__ = "src"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -62,7 +63,6 @@ async def lifespan(app: FastAPI):
 # ── App（中间件在模块加载时注册，通过 getter 延迟访问 _monitor）───────────
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(MemoryCheckMiddleware, monitor_getter=lambda: _monitor)
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────
@@ -283,6 +283,16 @@ def main():
     logger.info("Initializing model...")
     _engine = InferenceEngine()
     _engine.load(_config.model, _config.device)
+
+    # CORS 要第一个注册，确保 OPTIONS 能在到达路由前被拦截处理
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_config.server.cors_config.allow_origins,
+        allow_credentials=_config.server.cors_config.allow_credentials,
+        allow_methods=_config.server.cors_config.allow_methods,
+        allow_headers=_config.server.cors_config.allow_headers,
+    )
+    app.add_middleware(MemoryCheckMiddleware, monitor_getter=lambda: _monitor)
 
     logger.info("Starting server on %s:%d", host, port)
     uvicorn.run(

@@ -95,6 +95,14 @@ class LimitsConfig:
 
 
 @dataclass
+class CorsConfig:
+    allow_origins: List[str] = field(default_factory=lambda: ["*"])
+    allow_credentials: bool = False   # 注意：origins=["*"] 时必须为 False
+    allow_methods: List[str] = field(default_factory=lambda: ["*"])
+    allow_headers: List[str] = field(default_factory=lambda: ["*"])
+
+
+@dataclass
 class ServerConfig:
     """HTTP server configuration"""
     host: str = "0.0.0.0"
@@ -102,6 +110,7 @@ class ServerConfig:
     log_level: str = "INFO"
     timeout_keep_alive: int = 5
     limits: LimitsConfig = field(default_factory=LimitsConfig)
+    cors_config: CorsConfig = field(default_factory=CorsConfig)
 
 
 @dataclass
