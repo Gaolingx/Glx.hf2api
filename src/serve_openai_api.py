@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
     import asyncio
     cleanup_task = asyncio.ensure_future(_monitor.run_cleanup_loop())
 
-    logger.info("Server ready.")
+    logger.info("Server startup complete.")
     yield
 
     logger.info("Server shutting down...")

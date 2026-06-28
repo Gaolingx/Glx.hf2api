@@ -87,14 +87,6 @@ class MemoryConfig:
 
 
 @dataclass
-class BatchingConfig:
-    """Batch processor configuration"""
-    enabled: bool = True
-    max_batch_size: int = 8
-    batch_timeout_ms: int = 50
-
-
-@dataclass
 class LimitsConfig:
     """Server request limits"""
     max_queue_size: int = 100
@@ -109,7 +101,6 @@ class ServerConfig:
     port: int = 8998
     log_level: str = "INFO"
     timeout_keep_alive: int = 5
-    batching: BatchingConfig = field(default_factory=BatchingConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
 
 

@@ -24,7 +24,7 @@ class MemoryMonitor:
         self._request_ts: Dict[str, float] = {}
 
         logger.info(
-            "MemoryMonitor: max_ratio=%.2f, kv_timeout=%ds",
+            "MemoryMonitor initialized: max_ratio=%.2f, kv_timeout=%ds",
             self._max_ratio,
             self._kv_timeout_s,
         )
@@ -83,7 +83,7 @@ class MemoryMonitor:
             before = self.get_stats().get("cached_gb", 0)
             torch.cuda.empty_cache()
             after = self.get_stats().get("cached_gb", 0)
-            logger.info("GPU cache: %.2fGB → %.2fGB", before, after)
+            logger.info("GPU cache cleared: %.2fGB → %.2fGB", before, after)
 
         self._last_cleanup = now
 
@@ -98,5 +98,5 @@ class MemoryMonitor:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.error("Cleanup loop error: %s", exc, exc_info=True)
+                logger.error("Error in memory cleanup task: %s", exc, exc_info=True)
         logger.info("Memory cleanup loop stopped.")

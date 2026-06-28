@@ -52,8 +52,8 @@ class InferenceEngine:
         self.model = self._load_model(model_cfg, device_cfg)
         self._loaded = True
 
-        total = sum(p.numel() for p in self.model.parameters())
-        logger.info(f"Engine ready. Parameters: {total / 1e6:.1f}M")
+        total_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(f"Model loaded successfully. Total parameters: {total_params / 1e6:.2f}M")
 
     def _load_tokenizer(self, model_cfg: ModelConfig):
         POST_LOAD_FIELDS = {"chat_template", "eos_token", "pad_token"}
@@ -83,6 +83,8 @@ class InferenceEngine:
         return tokenizer
 
     def _load_model(self, model_cfg: ModelConfig, device_cfg: DeviceConfig):
+        logger.info(f"Loading model from {model_cfg.name_or_path}")
+
         model_kwargs: Dict[str, Any] = dict(model_cfg.model_kwargs)
         model_kwargs["trust_remote_code"] = model_cfg.trust_remote_code
         model_kwargs["revision"] = model_cfg.model_revision
@@ -111,7 +113,7 @@ class InferenceEngine:
         if quant_cfg.enabled:
             if not model_kwargs.get("device_map"):
                 model_kwargs["device_map"] = "auto"
-                logger.warning("Quantization requires device_map; auto-set to 'auto'.")
+                logger.warning("Quantization requires device_map, auto-setting to 'auto'.")
             model_kwargs["quantization_config"] = self._build_bnb_config(quant_cfg)
 
         logger.info(
@@ -309,6 +311,6 @@ class InferenceEngine:
         try:
             from transformers.integrations.liger import apply_liger_kernel
             apply_liger_kernel(model, model_cfg.kernel_config)
-            logger.info("Liger Kernel applied.")
+            logger.info("Applied Liger Kernel optimizations.")
         except ImportError:
-            logger.warning("liger_kernel not installed; skipping.")
+            logger.warning("liger_kernel not installed, skipping optimization.")
