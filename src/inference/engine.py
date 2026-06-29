@@ -82,6 +82,32 @@ class InferenceEngine:
         logger.info(f"Tokenizer loaded. vocab_size={len(tokenizer)}")
         return tokenizer
 
+    def _apply_use_cache(self, model: Any, use_cache: bool) -> None:
+        """
+        兼容两种 config 布局：
+        - 标准 CausalLM：use_cache 在 model.config 顶层
+        - 条件生成/多模态（如 Qwen3_5ForConditionalGeneration）：
+          use_cache 在 model.config.text_config 下
+        """
+        cfg = model.config
+
+        # 优先设置 text_config（多模态模型，如 Qwen3.5-VL / Qwen3_5ForConditionalGeneration）
+        if hasattr(cfg, "text_config") and hasattr(cfg.text_config, "use_cache"):
+            cfg.text_config.use_cache = use_cache
+            logger.debug(f"Set config.text_config.use_cache={use_cache}")
+
+        # 同时处理顶层（标准 CausalLM，或部分模型两处都有）
+        if hasattr(cfg, "use_cache"):
+            cfg.use_cache = use_cache
+            logger.debug(f"Set config.use_cache={use_cache}")
+
+        if not hasattr(cfg, "use_cache") and not (
+            hasattr(cfg, "text_config") and hasattr(cfg.text_config, "use_cache")
+        ):
+            logger.warning(
+                "use_cache override requested but model.config has no use_cache field; skipping."
+            )
+
     def _load_model(self, model_cfg: ModelConfig, device_cfg: DeviceConfig):
         logger.info(f"Loading model from {model_cfg.name_or_path}")
 
@@ -95,12 +121,9 @@ class InferenceEngine:
             getattr(torch, dtype_str) if dtype_str and dtype_str != "auto" else "auto"
         )
 
+        # attn_backend/device_map / multi-GPU
         if model_cfg.attn_implementation:
             model_kwargs["attn_implementation"] = model_cfg.attn_implementation
-        if model_cfg.use_cache is not None:
-            model_kwargs["use_cache"] = model_cfg.use_cache
-
-        # device_map / multi-GPU
         if device_cfg.gpus and not device_cfg.device_map:
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, device_cfg.gpus))
             model_kwargs["device_map"] = "auto"
@@ -121,6 +144,8 @@ class InferenceEngine:
             {k: v for k, v in model_kwargs.items() if k != "quantization_config"},
         )
         model = AutoModelForCausalLM.from_pretrained(model_cfg.name_or_path, **model_kwargs)
+
+        self._apply_use_cache(model, model_cfg.use_cache)
 
         # 没有 device_map 且未量化：手动 .to(device)
         use_device_map = bool(model_kwargs.get("device_map"))
